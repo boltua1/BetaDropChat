@@ -63,7 +63,7 @@ timeout /t 5 /nobreak >nul
 
 :: 3. Настройка окружения
 set ANTHROPIC_BASE_URL=http://127.0.0.1:9655
-set ANTHROPIC_API_KEY=BetaDropChat-key
+set ANTHROPIC_API_KEY=sk-ant-api03-betadrop-chat-key-7777777777777777777777777777777777777777777777777777777777777777777777
 set CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 
 :: 4. Запуск Claude

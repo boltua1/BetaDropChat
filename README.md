@@ -110,7 +110,7 @@ run-claude.bat
   "chrome_debug_port": 9334,
   "primaryModel": "deepseek-chat",
   "anthropicBaseUrl": "http://127.0.0.1:9655/v1",
-  "anthropicApiKey": "BetaDropChat-key"
+  "anthropicApiKey": "sk-ant-api03-betadrop-chat-key-7777777777777777777777777777777777777777777777777777777777777777777777"
 }
 ```
 

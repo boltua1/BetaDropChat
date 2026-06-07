@@ -1,0 +1,9 @@
+{
+  "auth_path": "./.deepseek/deepseek-auth.json",
+  "chrome_profile_dir": "./.deepseek/chrome-profile",
+  "server_port": 9655,
+  "chrome_debug_port": 9334,
+  "primaryModel": "deepseek-chat",
+  "anthropicBaseUrl": "http://127.0.0.1:9655/v1",
+  "anthropicApiKey": "BetaDropChat-key"
+}

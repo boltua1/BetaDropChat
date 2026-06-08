@@ -45,7 +45,26 @@ try {
 
 const PORT = Number(process.env.PORT || settings.server_port || 9655);
 const HOST = process.env.HOST || '127.0.0.1';
-// ------------------------
+
+// --- Logging System ---
+const LOG_ROOT = path.join(__dirname, 'logs');
+function writeLog(agentId, type, data) {
+    try {
+        const now = new Date();
+        const dateStr = now.toISOString().split('T')[0];
+        const timeStr = now.toISOString().split('T')[1].replace('Z', '');
+        const dir = path.join(LOG_ROOT, dateStr);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const safeAgentId = String(agentId || 'system').replace(/[^a-z0-9._-]/gi, '_');
+        const logFile = path.join(dir, `${safeAgentId}.log`);
+        const header = `[${timeStr}] [${type}] `;
+        const content = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+        fs.appendFileSync(logFile, header + content + '\n' + '='.repeat(50) + '\n');
+    } catch (e) {
+        console.error(`[DS-API] Logging error: ${e.message}`);
+    }
+}
+// ----------------------
 
 function formatWatermark(prefix = 'BetaDropChat') { return `${prefix}: ${FORGETMEAI_WATERMARK}`; }
 function printBanner() {
@@ -241,6 +260,62 @@ const MODEL_CONFIGS = {
         supported: false,
         unavailable_reason: 'Current Web API returns: Vision is temporarily unavailable (backend_err_by_model).',
     },
+
+    // --- Anthropic Model Aliases (for Claude Code / Claude Desktop compatibility) ---
+    'claude-3-5-sonnet-20240620': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V3 (Anthropic Sonnet alias)',
+        capabilities: { reasoning: false, web_search: false, files: true },
+        supported: true,
+    },
+    'claude-3-5-sonnet-20241022': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V3 (Anthropic Sonnet alias)',
+        capabilities: { reasoning: false, web_search: false, files: true },
+        supported: true,
+    },
+    'claude-3-5-sonnet-latest': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V3 (Anthropic Sonnet alias)',
+        capabilities: { reasoning: false, web_search: false, files: true },
+        supported: true,
+    },
+    'claude-3-7-sonnet-20250219': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V3 (Anthropic Sonnet 3.7 alias)',
+        capabilities: { reasoning: false, web_search: false, files: true },
+        supported: true,
+    },
+    'claude-3-opus-20240229': {
+        model_type: 'default', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek-R1 (Anthropic Opus alias)',
+        capabilities: { reasoning: true, web_search: false, files: true },
+        supported: true,
+    },
+    'claude-3-haiku-20240307': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V3 (Anthropic Haiku alias)',
+        capabilities: { reasoning: false, web_search: false, files: true },
+        supported: true,
+    },
+    'claude-3-5-haiku-20241022': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V3 (Anthropic Haiku 3.5 alias)',
+        capabilities: { reasoning: false, web_search: false, files: true },
+        supported: true,
+    },
+    'claude-4-5-20251001': {
+        model_type: 'default', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek-R1 (Anthropic Claude 4.5 alias)',
+        capabilities: { reasoning: true, web_search: false, files: true },
+        supported: true,
+    },
+    'claude-4-8': {
+        model_type: 'default', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek-R1 (Anthropic Claude 4.8 alias)',
+        capabilities: { reasoning: true, web_search: false, files: true },
+        supported: true,
+    },
 };
 
 const SUPPORTED_MODEL_IDS = Object.keys(MODEL_CONFIGS).filter(id => MODEL_CONFIGS[id].supported);
@@ -290,7 +365,14 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
         method: 'POST', headers: BASE_HEADERS,
         body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
     });
-    const chalJson = JSON.parse(await cr.text());
+    const crText = await cr.text();
+    let chalJson;
+    try {
+        chalJson = JSON.parse(crText);
+    } catch (e) {
+        writeLog(agentId, 'ERROR-POW-JSON', { status: cr.status, text: crText, error: e.message });
+        throw new Error(`Failed to parse POW challenge JSON: ${e.message}. Status: ${cr.status}`);
+    }
     const challenge = chalJson.data.biz_data.challenge;
     const answer = await solvePOW(challenge);
 
@@ -298,12 +380,20 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
         const sr = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
             method: 'POST', headers: BASE_HEADERS, body: '{}'
         });
-        const sessionData = await sr.json();
+        const srText = await sr.text();
+        let sessionData;
+        try {
+            sessionData = JSON.parse(srText);
+        } catch (e) {
+            writeLog(agentId, 'ERROR-SESSION-JSON', { status: sr.status, text: srText, error: e.message });
+            throw new Error(`Failed to parse session create JSON: ${e.message}. Status: ${sr.status}`);
+        }
         session.id = sessionData.data.biz_data.chat_session?.id || sessionData.data.biz_data.id;
         session.parentMessageId = null;
         session.createdAt = Date.now();
         session.messageCount = 0;
         console.log(`${agentTag} Created new session: ${session.id}`);
+        writeLog(agentId, 'SESSION-CREATED', { sessionId: session.id });
     } else {
         console.log(`${agentTag} Reusing session: ${session.id} (parent: ${session.parentMessageId}, msg#${session.messageCount})`);
     }
@@ -313,6 +403,14 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
         salt: challenge.salt, answer: answer,
         signature: challenge.signature, target_path: '/api/v0/chat/completion'
     })).toString('base64');
+    
+    writeLog(agentId, 'DS-REQUEST', {
+        sessionId: session.id,
+        parentMessageId: session.parentMessageId,
+        model: modelCfg.real_model,
+        prompt: prompt.substring(0, 500) + (prompt.length > 500 ? '...' : '')
+    });
+
     const resp = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
         method: 'POST',
         headers: { ...BASE_HEADERS, 'X-DS-PoW-Response': powB64 },
@@ -340,7 +438,14 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
             const sr2 = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
                 method: 'POST', headers: BASE_HEADERS, body: '{}'
             });
-            const sessionData2 = await sr2.json();
+            const sr2Text = await sr2.text();
+            let sessionData2;
+            try {
+                sessionData2 = JSON.parse(sr2Text);
+            } catch (e) {
+                writeLog(agentId, 'ERROR-SESSION-RETRY-JSON', { status: sr2.status, text: sr2Text, error: e.message });
+                throw new Error(`Failed to parse retry session JSON: ${e.message}. Status: ${sr2.status}`);
+            }
             session.id = sessionData2.data.biz_data.chat_session?.id || sessionData2.data.biz_data.id;
             session.parentMessageId = null;
             session.createdAt = Date.now();
@@ -1056,37 +1161,46 @@ const server = http.createServer(async (req, res) => {
     let body = '';
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
+        const remoteAddr = req.socket.remoteAddress || 'unknown';
+        const isLocal = (remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1');
+        
         try {
             const bodyParams = JSON.parse(body || '{}');
+            const requestedSession = req.headers['x-agent-session'] || bodyParams.session || bodyParams.user || (isLocal ? 'dev-agent' : remoteAddr);
+            const agentId = String(requestedSession);
+            
+            writeLog(agentId, 'INCOMING-REQUEST', {
+                path: cleanPath,
+                headers: req.headers,
+                body: bodyParams
+            });
+
             const params = normalizeApiParams(bodyParams, apiMode);
             const messages = params.messages || [];
             const tools = params.tools || [];
             const stream = params.stream === true;
+            const agentTag = `[${agentId}]`;
             
             let requestedModel = String(params.model || 'deepseek-chat').toLowerCase();
+            
+            writeLog(agentId, 'MODEL-INFO', { 
+                requested_model: requestedModel,
+                is_known: isKnownModel(requestedModel),
+                is_supported: isKnownModel(requestedModel) ? isSupportedModel(requestedModel) : false
+            });
+
             if (!isKnownModel(requestedModel)) {
-                if (apiMode === 'anthropic') {
-                    console.log(`[DS-API] Unknown Anthropic model "${requestedModel}", falling back to deepseek-chat`);
-                    requestedModel = 'deepseek-chat';
-                } else {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: { message: `Unknown model: ${requestedModel}`, type: 'invalid_model', supported_models: SUPPORTED_MODEL_IDS, model_capabilities_url: '/v1/model-capabilities' } }));
-                    return;
-                }
-            }
-            if (!isSupportedModel(requestedModel)) {
+                const fallback = 'deepseek-chat';
+                console.log(`[DS-API] ${agentTag} 🔀 Model Mapping: "${requestedModel}" -> "${fallback}" (Unknown model)`);
+                writeLog(agentId, 'MODEL-MAPPING', { from: requestedModel, to: fallback, reason: 'unknown' });
+                requestedModel = fallback;
+            } else if (!isSupportedModel(requestedModel)) {
+                const fallback = 'deepseek-chat';
                 const cfg = resolveModelConfig(requestedModel);
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: { message: `${requestedModel} is not currently supported through this DeepSeek Web API path`, type: 'unsupported_model', model: requestedModel, real_model: cfg.real_model, reason: cfg.unavailable_reason, capabilities: cfg.capabilities, supported_models: SUPPORTED_MODEL_IDS } }));
-                return;
+                console.log(`[DS-API] ${agentTag} ⚠️ Model "${requestedModel}" is unsupported (${cfg.unavailable_reason || 'disabled'}). Mapping to "${fallback}"`);
+                writeLog(agentId, 'MODEL-MAPPING', { from: requestedModel, to: fallback, reason: 'unsupported', detail: cfg.unavailable_reason });
+                requestedModel = fallback;
             }
-            // Use remote IP for session isolation (local gets 'dev-agent', external per-IP)
-            const remoteAddr = req.socket.remoteAddress || 'unknown';
-            const requestedSession = req.headers['x-agent-session'] || params.session || params.user;
-            const agentId = requestedSession
-                ? String(requestedSession)
-                : ((remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1') ? 'dev-agent' : remoteAddr);
-            const agentTag = `[${agentId}]`;
             const { prompt, systemPrompt } = formatMessages(messages, tools);
 
             const session = getOrCreateAgentSession(agentId);
@@ -1098,7 +1212,14 @@ const server = http.createServer(async (req, res) => {
                         const sr = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
                             method: 'POST', headers: BASE_HEADERS, body: '{}'
                         });
-                        const sessionData = await sr.json();
+                        const srText = await sr.text();
+                        let sessionData;
+                        try {
+                            sessionData = JSON.parse(srText);
+                        } catch (e) {
+                            writeLog(agentId, 'ERROR-SESSION-CREATE-JSON', { status: sr.status, text: srText, error: e.message });
+                            throw new Error(`Failed to parse session creation JSON: ${e.message}. Status: ${sr.status}`);
+                        }
                         const newId = sessionData.data.biz_data.chat_session?.id || sessionData.data.biz_data.id;
                         session.id = newId;
                         session.parentMessageId = null;
@@ -1178,6 +1299,7 @@ const server = http.createServer(async (req, res) => {
                                 if (d.type === 'error' || d.finish_reason || d.content) {
                                     modelError = { type: d.type || 'error', content: d.content || '', finish_reason: d.finish_reason || null };
                                     if (d.finish_reason) finishReason = d.finish_reason;
+                                    writeLog(agentId, 'DS-MODEL-ERROR-FRAGMENT', d);
                                 }
                                 if (d.p !== undefined) lastPath = d.p;
                                 if (d.v && typeof d.v === 'object' && d.v.response) {
@@ -1344,9 +1466,18 @@ const server = http.createServer(async (req, res) => {
 
             storeHistory(agentId, prompt, fullContent, toolCall);
 
+            // If we have reasoning content but the client might not support it natively (OpenAI-style),
+            // prepend it to the content in a readable block if requested or by default for reasoner models.
+            let finalContent = fullContent;
+            if (reasoningContent && reasoningContent.trim().length > 0 && !toolCall) {
+                // If it's not a tool call, we can safely prepend reasoning to the text.
+                // For tool calls, we keep reasoning separate to avoid breaking JSON parsers in clients.
+                finalContent = `<thought>\n${reasoningContent}\n</thought>\n\n${fullContent}`;
+            }
+
             const openaiResponse = toolCall
                 ? buildToolCallResponse(toolCall, requestedModel, fullPrompt, reasoningContent)
-                : buildTextResponse(fullContent, fullPrompt, requestedModel, reasoningContent);
+                : buildTextResponse(finalContent, fullPrompt, requestedModel, reasoningContent);
 
             if (stream) {
                 if (apiMode === 'anthropic') {
@@ -1367,9 +1498,11 @@ const server = http.createServer(async (req, res) => {
                     res.end(JSON.stringify(openaiResponse));
                 }
                 console.log(`${agentTag} Response ${apiMode} (tool=${!!toolCall}, ${elapsed}ms, ${fullContent.length} chars)`);
+                writeLog(agentId, 'OUTGOING-RESPONSE', { mode: apiMode, tool: !!toolCall, elapsed, chars: fullContent.length });
             }
         } catch (e) {
             console.log('[DS-API] Error:', e.message);
+            writeLog('system', 'SERVER-ERROR', { error: e.message, stack: e.stack });
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: { message: e.message, type: 'server_error' } }));
         }

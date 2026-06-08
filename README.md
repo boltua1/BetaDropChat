@@ -120,8 +120,10 @@ run-claude.bat
 
 | Модель | Режим Web | Reasoning | Поиск |
 | --- | --- | --- | --- |
-| `deepseek-chat` | Быстрый (V3) | Нет | Нет |
+| `deepseek-chat` | Быстрый (V3/V4) | Нет | Нет |
 | `deepseek-reasoner` | Быстрый (R1) | Да | Нет |
+| `claude-3-5-sonnet` | Псевдоним для V3 | Нет | Нет |
+| `claude-4-5 / 4.8` | Псевдоним для R1 | Да | Нет |
 | `deepseek-expert` | Эксперт | Нет | Нет |
 | `deepseek-v4-pro` | Эксперт + R1 | Да | Нет |
 

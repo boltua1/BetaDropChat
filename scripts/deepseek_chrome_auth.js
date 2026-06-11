@@ -35,11 +35,17 @@ try {
   console.error(`[auth] Error reading settings.json: ${e.message}`);
 }
 
-const profileDir = process.env.DEEPSEEK_CHROME_PROFILE || 
-  (settings.chrome_profile_dir ? path.resolve(repoRoot, settings.chrome_profile_dir) : path.join(repoRoot, '.deepseek', 'chrome-profile'));
+const outSuffix = process.env.DEEPSEEK_AUTH_SUFFIX || '';
+
+// If a suffix is provided, we ignore hardcoded paths from settings.json to ensure multi-account separation
+const profileDir = process.env.DEEPSEEK_CHROME_PROFILE ||
+  ((settings.chrome_profile_dir && !outSuffix) ? path.resolve(repoRoot, settings.chrome_profile_dir) : path.join(repoRoot, '.deepseek', outSuffix ? `chrome-profile-${outSuffix}` : 'chrome-profile'));
+
 const port = Number(process.env.DEEPSEEK_CHROME_PORT || settings.chrome_debug_port || 9334);
+const outName = outSuffix ? `deepseek-auth-${outSuffix}.json` : 'deepseek-auth.json';
+
 const outPath = process.env.DEEPSEEK_AUTH_PATH || 
-  (settings.auth_path ? path.resolve(repoRoot, settings.auth_path) : path.join(repoRoot, '.deepseek', 'deepseek-auth.json'));
+  ((settings.auth_path && !outSuffix) ? path.resolve(repoRoot, settings.auth_path) : path.join(repoRoot, '.deepseek', outName));
 // ------------------------
 
 const url = 'https://chat.deepseek.com/';
@@ -203,8 +209,11 @@ async function getPageTarget() {
   }
   throw new Error('No Chrome page target found');
 }
-class CDP {
+const { EventEmitter } = require('events');
+
+class CDP extends EventEmitter {
   constructor(wsUrl) {
+    super();
     this.ws = new WebSocket(wsUrl);
     this.id = 0;
     this.pending = new Map();
@@ -216,6 +225,7 @@ class CDP {
         this.pending.delete(msg.id);
         msg.error ? reject(new Error(JSON.stringify(msg.error))) : resolve(msg.result);
       } else if (msg.method) {
+        this.emit(msg.method, msg.params);
         this.events.push(msg);
         if (this.events.length > 1000) this.events.shift();
       }
@@ -289,6 +299,71 @@ async function readPageAuth(cdp) {
     'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm';
   return { token, cookie, hif_dliq, hif_leim, wasmUrl, baseUrl: 'https://chat.deepseek.com', href: pageState.href, cookiesCount: cookies.length };
 }
+let chromeProcess = null;
+
+function cleanup() {
+  if (chromeProcess) {
+    console.log('[auth] Closing browser...');
+    try {
+      if (process.platform === 'win32') {
+        execFileSync('taskkill', ['/F', '/T', '/PID', chromeProcess.pid], { stdio: 'ignore' });
+      } else {
+        chromeProcess.kill();
+      }
+    } catch (e) {}
+    chromeProcess = null;
+  }
+}
+
+process.on('SIGINT', () => { cleanup(); process.exit(0); });
+process.on('SIGTERM', () => { cleanup(); process.exit(0); });
+
+async function captureWasm(cdp) {
+  try {
+    const evalRes = await cdp.send('Runtime.evaluate', {
+      expression: `(async () => {
+        const resources = performance.getEntriesByType('resource');
+        const wasmEntry = resources.find(r => r.name.includes('.wasm'));
+        if (!wasmEntry) {
+           return { error: 'no_wasm_found', found_types: resources.map(r => r.name.split('.').pop()).slice(-10) };
+        }
+        
+        try {
+          const resp = await fetch(wasmEntry.name);
+          const buf = await resp.arrayBuffer();
+          const arr = new Uint8Array(buf);
+          let binary = '';
+          for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);
+          return { url: wasmEntry.name, size: arr.length, data: btoa(binary) };
+        } catch (e) {
+          return { error: 'fetch_failed', message: e.message, url: wasmEntry.name };
+        }
+      })()`,
+      awaitPromise: true,
+      returnByValue: true
+    });
+
+    const result = evalRes.result.value;
+    if (result && result.data) {
+      const buffer = Buffer.from(result.data, 'base64');
+      if (buffer.length > 10000 && buffer[0] === 0x00 && buffer[1] === 0x61 && buffer[2] === 0x73 && buffer[3] === 0x6d) {
+        const wasmPath = path.join(repoRoot, '.deepseek', 'pow.wasm');
+        if (!fs.existsSync(path.dirname(wasmPath))) fs.mkdirSync(path.dirname(wasmPath), { recursive: true });
+        fs.writeFileSync(wasmPath, buffer);
+        console.log(`[auth] ✅ Captured and saved pow.wasm from ${result.url} (${buffer.length} bytes)`);
+        return true;
+      }
+    } else if (result?.error === 'no_wasm_found') {
+        // console.log('[auth] No .wasm found in performance resources yet.');
+    } else if (result?.error) {
+      console.log(`[auth] WASM capture attempt failed: ${result.error} ${result.message || ''}`);
+    }
+  } catch (e) {
+    // console.log(`[auth] CDP capture error: ${e.message}`);
+  }
+  return false;
+}
+
 async function main() {
   if (!fs.existsSync(chromePath)) throw new Error(`Chrome/Chrome for Testing not found: ${chromePath}. Set CHROME_PATH.`);
 
@@ -306,7 +381,7 @@ async function main() {
   } else {
     console.log(`[auth] Starting clean Chrome for Testing profile: ${profileDir}`);
     console.log(`[auth] Browser executable: ${chromePath}`);
-    const chrome = spawn(chromePath, [
+    chromeProcess = spawn(chromePath, [
       `--user-data-dir=${profileDir}`,
       `--remote-debugging-port=${port}`,
       '--use-mock-keychain',
@@ -318,7 +393,7 @@ async function main() {
       '--no-first-run', '--no-default-browser-check', '--disable-infobars',
       url,
     ], { stdio: 'ignore', detached: true });
-    chrome.unref();
+    chromeProcess.unref();
   }
 
   await waitDevtools();
@@ -328,9 +403,42 @@ async function main() {
   await cdp.send('Runtime.enable');
   await cdp.send('Network.enable');
 
-  console.log('\n[auth] Chrome открыт. Войди в DeepSeek в ЭТОМ отдельном окне.');
+  // FORCE DISABLE CACHE so we can capture the WASM even if it was previously cached
+  await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
+
+  cdp.on('Network.responseReceived', async (params) => {
+    const url = params.response.url;
+    
+    if (url.includes('.wasm')) {
+      try {
+        const { body, base64Encoded } = await cdp.send('Network.getResponseBody', { requestId: params.requestId });
+        const buffer = base64Encoded ? Buffer.from(body, 'base64') : Buffer.from(body);
+        
+        // Validation: Must be a WASM file (\0asm)
+        if (buffer.length > 10000 && buffer[0] === 0x00 && buffer[1] === 0x61 && buffer[2] === 0x73 && buffer[3] === 0x6d) {
+          const wasmPath = path.join(repoRoot, '.deepseek', 'pow.wasm');
+          if (!fs.existsSync(path.dirname(wasmPath))) fs.mkdirSync(path.dirname(wasmPath), { recursive: true });
+          fs.writeFileSync(wasmPath, buffer);
+          console.log(`[auth] ✅ Captured and saved pow.wasm from ${url} (${buffer.length} bytes)`);
+        }
+      } catch (e) {
+        // Body might not be available if it's a cache hit or very fast, 
+        // but often CDP can still get it. If it fails, we still have the backup captureWasm call on Enter.
+      }
+    }
+
+    if (url.includes('/api/v0/chat/completion')) {
+      console.log(`[auth] Activity detected: ${url}`);
+    }
+  });
+
+  console.log(`\n[auth] Chrome открыт. Войди в DeepSeek в ЭТОМ отдельном окне.`);
   console.log('[auth] После логина отправь в DeepSeek короткое сообщение, например: ok');
+
   await ask('[auth] Когда залогинился и отправил тестовое сообщение — нажми ENTER здесь: ');
+
+  // Try to capture WASM again from page context if network capture missed it (e.g. disk cache hit)
+  await captureWasm(cdp);
 
   let auth = null;
   for (let i = 0; i < 20; i++) {
@@ -345,7 +453,10 @@ async function main() {
   console.log(`[auth] token: ${persisted.token ? 'OK (' + persisted.token.length + ' chars)' : 'MISSING'}`);
   console.log(`[auth] cookie: ${persisted.cookie ? 'OK (' + cookiesCount + ' cookies)' : 'MISSING'}`);
   console.log(`[auth] hif headers: ${persisted.hif_dliq || persisted.hif_leim ? 'captured' : 'not captured/optional'}`);
+  
   cdp.close();
+  cleanup(); // Close browser on success
+
   if (!persisted.token || !persisted.cookie) process.exitCode = 2;
 }
 main().catch(e => { console.error('[auth] ERROR:', e); process.exit(1); });

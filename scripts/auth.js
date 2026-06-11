@@ -17,57 +17,65 @@ try {
   console.error(`[auth-menu] Error reading settings.json: ${e.message}`);
 }
 
-const AUTH_PATH = process.env.DEEPSEEK_AUTH_PATH || 
-  (settings.auth_path ? path.resolve(ROOT, settings.auth_path) : path.join(ROOT, '.deepseek', 'deepseek-auth.json'));
-const PROFILE_DIR = process.env.DEEPSEEK_CHROME_PROFILE || 
-  (settings.chrome_profile_dir ? path.resolve(ROOT, settings.chrome_profile_dir) : path.join(ROOT, '.deepseek', 'chrome-profile'));
-// ------------------------
-
-const WATERMARK = '';
+const DEEPSEEK_DIR = path.join(ROOT, '.deepseek');
+if (!fs.existsSync(DEEPSEEK_DIR)) fs.mkdirSync(DEEPSEEK_DIR, { recursive: true });
 
 function prompt(question) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise(resolve => rl.question(question, ans => { rl.close(); resolve(ans); }));
 }
 function divider() { console.log('======================================================'); }
-function watermark(prefix = 'BetaDropChat') { return `${prefix}: ${WATERMARK}`; }
-function loadAuth() {
-  try { return JSON.parse(fs.readFileSync(AUTH_PATH, 'utf8')); }
-  catch { return null; }
+function watermark(prefix = 'BetaDropChat') { return `BetaDropChat: Multi-Account Management`; }
+
+function listAccounts() {
+    const files = fs.readdirSync(DEEPSEEK_DIR).filter(f => f.startsWith('deepseek-auth') && f.endsWith('.json'));
+    return files.map(f => {
+        const id = f === 'deepseek-auth.json' ? 'default' : f.replace('deepseek-auth-', '').replace('.json', '');
+        return { id, file: f, path: path.join(DEEPSEEK_DIR, f) };
+    });
 }
+
 function status() {
-  const auth = loadAuth();
-  console.log('\nDeepSeek аккаунт:');
-  if (!auth) {
-    console.log('  ❌ deepseek-auth.json не найден');
+  const accounts = listAccounts();
+  console.log('\nУстановленные аккаунты DeepSeek:');
+  if (accounts.length === 0) {
+    console.log('  ❌ Аккаунты не найдены');
   } else {
-    console.log(`  ✅ auth file: ${AUTH_PATH}`);
-    console.log(`  token: ${auth.token ? 'OK (' + String(auth.token).length + ' chars)' : 'MISSING'}`);
-    console.log(`  cookies: ${auth.cookie ? 'OK' : 'MISSING'}`);
-    console.log(`  Chrome profile: ${fs.existsSync(PROFILE_DIR) ? PROFILE_DIR : 'не найден'}`);
+    accounts.forEach(acc => {
+        try {
+            const data = JSON.parse(fs.readFileSync(acc.path, 'utf8'));
+            const profileDir = path.join(DEEPSEEK_DIR, acc.id === 'default' ? 'chrome-profile' : `chrome-profile-${acc.id}`);
+            console.log(`  [${acc.id}]`);
+            console.log(`    Файл: ${acc.file}`);
+            console.log(`    Token: ${data.token ? '✅ OK' : '❌ MISSING'}`);
+            console.log(`    Profile: ${fs.existsSync(profileDir) ? '✅ OK' : '⚠️ NOT FOUND'}`);
+        } catch (e) {
+            console.log(`  [${acc.id}] ❌ Ошибка чтения файла: ${acc.file}`);
+        }
+    });
   }
 }
-function runDirectAuth() {
-  const script = path.join(__dirname, 'deepseek_chrome_auth.js');
-  return spawnSync(process.execPath, [script], { stdio: 'inherit', env: process.env }).status === 0;
+
+async function runAuthForAccount(id) {
+    const isDefault = id === 'default';
+    const authFileName = isDefault ? 'deepseek-auth.json' : `deepseek-auth-${id}.json`;
+    const profileDirName = isDefault ? 'chrome-profile' : `chrome-profile-${id}`;
+    const debugPort = isDefault ? (settings.chrome_debug_port || 9334) : (settings.chrome_debug_port || 9334) + Math.floor(Math.random() * 1000) + 1;
+
+    console.log(`\n[Auth] Запуск авторизации для аккаунта: ${id}`);
+    
+    const env = { 
+        ...process.env, 
+        DEEPSEEK_AUTH_PATH: path.join(DEEPSEEK_DIR, authFileName),
+        DEEPSEEK_CHROME_PROFILE: path.join(DEEPSEEK_DIR, profileDirName),
+        CHROME_DEBUG_PORT: String(debugPort)
+    };
+
+    const script = path.join(__dirname, 'deepseek_chrome_auth.js');
+    const result = spawnSync(process.execPath, [script], { stdio: 'inherit', env });
+    return result.status === 0;
 }
-function removeLocalAuth() {
-  if (fs.existsSync(AUTH_PATH)) fs.rmSync(AUTH_PATH, { force: true });
-  console.log('Удалён deepseek-auth.json. Chrome profile оставлен, чтобы не разлогинивать браузер без нужды.');
-}
-function printHelp() {
-  divider();
-  console.log('BetaDropChat — управление DeepSeek Web login');
-  console.log(watermark());
-  divider();
-  console.log('Опции:');
-  console.log('  --login     Открыть Chrome и обновить auth');
-  console.log('  --status    Показать статус auth');
-  console.log('  --remove    Удалить локальный deepseek-auth.json');
-  console.log('  --help      Справка');
-  console.log('Без опций запускается интерактивное меню.');
-  divider();
-}
+
 async function menu() {
   while (true) {
     divider();
@@ -75,22 +83,27 @@ async function menu() {
     status();
     divider();
     console.log('Меню:');
-    console.log('1 - Авторизоваться / обновить DeepSeek login');
-    console.log('2 - Показать статус');
-    console.log('3 - Удалить локальный auth файл');
-    console.log('4 - Выход');
-    const choice = (await prompt('Ваш выбор (Enter = 4): ')) || '4';
-    if (choice === '1') runDirectAuth();
-    else if (choice === '2') { status(); await prompt('\nНажмите Enter, чтобы вернуться в меню...'); }
-    else if (choice === '3') removeLocalAuth();
-    else if (choice === '4') break;
+    console.log('1 - Добавить / обновить аккаунт (введите ID)');
+    console.log('2 - Удалить аккаунт');
+    console.log('3 - Выход');
+    const choice = (await prompt('Ваш выбор: ')) || '3';
+    
+    if (choice === '1') {
+        const id = await prompt('Введите ID аккаунта (например: "2" или "work", Enter для "default"): ') || 'default';
+        await runAuthForAccount(id);
+    } else if (choice === '2') {
+        const id = await prompt('Введите ID аккаунта для удаления: ');
+        if (!id) continue;
+        const fileName = id === 'default' ? 'deepseek-auth.json' : `deepseek-auth-${id}.json`;
+        const filePath = path.join(DEEPSEEK_DIR, fileName);
+        if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+            console.log(`Аккаунт ${id} удален.`);
+        } else {
+            console.log(`Файл ${fileName} не найден.`);
+        }
+    } else if (choice === '3') break;
   }
 }
-(async () => {
-  const args = new Set(process.argv.slice(2));
-  if (args.has('--help') || args.has('-h')) return printHelp();
-  if (args.has('--login') || args.has('--add') || args.has('--relogin')) return void runDirectAuth();
-  if (args.has('--status') || args.has('--list')) return status();
-  if (args.has('--remove')) return removeLocalAuth();
-  await menu();
-})();
+
+menu();

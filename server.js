@@ -16,6 +16,7 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
+const { Worker } = require('worker_threads');
 
 const SERVER_HOST = os.hostname();  // Dynamic hostname detection
 const SERVER_PUBLIC_IP = (() => {
@@ -48,13 +49,18 @@ const HOST = process.env.HOST || '127.0.0.1';
 
 // --- Logging System ---
 const LOG_ROOT = path.join(__dirname, 'logs');
-function writeLog(agentId, type, data) {
+function writeLog(accountId, agentId, type, data) {
     try {
         const now = new Date();
         const dateStr = now.toISOString().split('T')[0];
         const timeStr = now.toISOString().split('T')[1].replace('Z', '');
-        const dir = path.join(LOG_ROOT, dateStr);
+        
+        // Structure: logs/YYYY-MM-DD/accountId/agentId.log
+        const safeAccountId = String(accountId || 'default').replace(/[^a-z0-9._-]/gi, '_');
+        const dir = path.join(LOG_ROOT, dateStr, safeAccountId);
+        
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        
         const safeAgentId = String(agentId || 'system').replace(/[^a-z0-9._-]/gi, '_');
         const logFile = path.join(dir, `${safeAgentId}.log`);
         const header = `[${timeStr}] [${type}] `;
@@ -64,6 +70,66 @@ function writeLog(agentId, type, data) {
         console.error(`[DS-API] Logging error: ${e.message}`);
     }
 }
+
+// ----------------------
+
+// === Multi-Account Pool ===
+const DEEPSEEK_DIR = path.join(__dirname, '.deepseek');
+const accountPool = new Map(); // id -> config
+
+function buildBaseHeaders(config) {
+    return {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        "x-client-platform": "web",
+        "x-client-version": "2.0.0",
+        "x-client-locale": "ru",
+        "x-client-timezone-offset": "14400",
+        "x-app-version": "2.0.0",
+        "Authorization": `Bearer ${config.token || ''}`,
+        "x-hif-dliq": config.hif_dliq || '',
+        "x-hif-leim": config.hif_leim || '',
+        "Origin": "https://chat.deepseek.com",
+        "Referer": "https://chat.deepseek.com/",
+        "Cookie": config.cookie || '',
+        "Content-Type": "application/json",
+    };
+}
+
+function loadAccountPool() {
+    if (!fs.existsSync(DEEPSEEK_DIR)) return;
+    const files = fs.readdirSync(DEEPSEEK_DIR).filter(f => f.startsWith('deepseek-auth') && f.endsWith('.json'));
+    accountPool.clear();
+    
+    files.forEach(f => {
+        try {
+            const id = f === 'deepseek-auth.json' ? 'default' : f.replace('deepseek-auth-', '').replace('.json', '');
+            const raw = fs.readFileSync(path.join(DEEPSEEK_DIR, f), 'utf8');
+            const config = JSON.parse(raw);
+            config.headers = buildBaseHeaders(config);
+            config.id = id;
+            accountPool.set(id, config);
+            console.log(`[DS-API] Loaded account: ${id}`);
+        } catch (e) {
+            console.error(`[DS-API] Error loading account ${f}: ${e.message}`);
+        }
+    });
+}
+
+function getAccountForAgent(agentId) {
+    if (accountPool.size === 0) return null;
+    
+    // Simple Sticky Session: hash agentId to an account index
+    const accounts = Array.from(accountPool.values());
+    let hash = 0;
+    for (let i = 0; i < agentId.length; i++) {
+        hash = ((hash << 5) - hash) + agentId.charCodeAt(i);
+        hash |= 0; 
+    }
+    const index = Math.abs(hash) % accounts.length;
+    return accounts[index];
+}
+
+loadAccountPool();
 // ----------------------
 
 function formatWatermark(prefix = 'BetaDropChat') { return `${prefix}: ${FORGETMEAI_WATERMARK}`; }
@@ -75,7 +141,7 @@ function printBanner() {
 ██   ██ ██         ██    ██   ██ ██   ██ ██   ██ ██    ██ ██      
 ██████  ███████    ██    ██   ██ ██████  ██   ██  ██████  ██      
                                                                   
-   BetaDropChat — API-прокси для DeepSeek Web Chat
+   BetaDropChat — API-прокси для DeepSeek Web Chat (Multi-Account Edition)
    ${formatWatermark()}
 `);
 }
@@ -86,93 +152,106 @@ function prompt(question) {
 function isTruthy(value) { return typeof value === 'string' && ['1','true','yes','on'].includes(value.trim().toLowerCase()); }
 
 // === Per-Agent Session Store ===
-const sessions = new Map();  // keyed by agent ID (from `user` field)
-const sessionCreationPromises = new Map(); // Lock for concurrent session creation
+const sessions = new Map();  // keyed by agent ID
+const sessionCreationPromises = new Map();
 const MAX_HISTORY_LENGTH = 15;
 const MAX_HISTORY_CHARS = 10000;
-const MAX_MESSAGE_DEPTH = 100;  // auto-reset after this many messages
-const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
+const MAX_MESSAGE_DEPTH = 100;
+const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
 
-// === DeepSeek Web API Config — loaded from external config file ===
-const DS_CONFIG_PATH = process.env.DEEPSEEK_AUTH_PATH || 
-    (settings.auth_path ? path.resolve(__dirname, settings.auth_path) : path.join(__dirname, '.deepseek', 'deepseek-auth.json'));
-let DS_CONFIG = {};
-let BASE_HEADERS = {};
-function buildBaseHeaders() {
-    return {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
-        "x-client-platform": "web",
-        "x-client-version": "2.0.0",
-        "x-client-locale": "ru",
-        "x-client-timezone-offset": "14400",
-        "x-app-version": "2.0.0",
-        "Authorization": `Bearer ${DS_CONFIG.token || ''}`,
-        "x-hif-dliq": DS_CONFIG.hif_dliq || '',
-        "x-hif-leim": DS_CONFIG.hif_leim || '',
-        "Origin": "https://chat.deepseek.com",
-        "Referer": "https://chat.deepseek.com/",
-        "Cookie": DS_CONFIG.cookie || '',
-        "Content-Type": "application/json",
-    };
-}
-function loadDeepSeekConfig({ fatal = true } = {}) {
-    try {
-        const raw = fs.readFileSync(DS_CONFIG_PATH, 'utf8');
-        DS_CONFIG = JSON.parse(raw);
-        BASE_HEADERS = buildBaseHeaders();
-        console.log(`[DS-API] Loaded auth config from ${DS_CONFIG_PATH}`);
-        return true;
-    } catch (e) {
-        DS_CONFIG = {};
-        BASE_HEADERS = buildBaseHeaders();
-        if (fatal) {
-            console.error(`[DS-API] FATAL: Could not load auth config: ${e.message}`);
-            process.exit(1);
-        }
-        return false;
+// === Rate Limiting ===
+const RATE_LIMIT_COUNT = 3;
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const requestLogs = new Map();
+
+function checkRateLimit(agentId) {
+    const now = Date.now();
+    if (!requestLogs.has(agentId)) requestLogs.set(agentId, []);
+    const logs = requestLogs.get(agentId);
+    while (logs.length > 0 && logs[0] < now - RATE_LIMIT_WINDOW_MS) logs.shift();
+    if (logs.length >= RATE_LIMIT_COUNT) {
+        return { limited: true, waitMs: Math.max(0, logs[0] + RATE_LIMIT_WINDOW_MS - now) };
     }
+    logs.push(now);
+    return { limited: false };
 }
-function hasAuthConfig() { return !!(DS_CONFIG.token && DS_CONFIG.cookie); }
-loadDeepSeekConfig({ fatal: false });
 
 function createSession() {
-    return {
-        id: null,
-        parentMessageId: null,
-        createdAt: null,
-        messageCount: 0,
-        history: [],
-    };
+    return { id: null, parentMessageId: null, createdAt: null, messageCount: 0, history: [] };
 }
 
 function getOrCreateAgentSession(agentId) {
-    if (!sessions.has(agentId)) {
-        sessions.set(agentId, createSession());
-    }
+    if (!sessions.has(agentId)) sessions.set(agentId, createSession());
     return sessions.get(agentId);
 }
 
-async function solvePOW(challenge) {
-    const resp = await fetch(DS_CONFIG.wasmUrl);
-    const wasmBytes = await resp.arrayBuffer();
-    const mod = await WebAssembly.instantiate(wasmBytes, { wbg: {} });
-    const e = mod.instance.exports;
-    const encoder = new TextEncoder();
-    const prefix = challenge.salt + '_' + challenge.expire_at + '_';
-    const cBytes = encoder.encode(challenge.challenge);
-    const pBytes = encoder.encode(prefix);
-    const cP = e.__wbindgen_export_0(cBytes.length, 1) >>> 0;
-    const pP = e.__wbindgen_export_0(pBytes.length, 1) >>> 0;
-    new Uint8Array(e.memory.buffer, cP, cBytes.length).set(cBytes);
-    new Uint8Array(e.memory.buffer, pP, pBytes.length).set(pBytes);
-    const sp = e.__wbindgen_add_to_stack_pointer(-16);
-    e.wasm_solve(sp, cP, cBytes.length, pP, pBytes.length, challenge.difficulty);
-    const dv = new DataView(e.memory.buffer);
-    const code = dv.getInt32(sp, true);
-    const ans = dv.getFloat64(sp + 8, true);
-    e.__wbindgen_add_to_stack_pointer(16);
-    if (code === 0 || !Number.isFinite(ans) || ans <= 0) throw new Error('POW failed');
-    return Math.floor(ans);
+async function ensureAgentSession(agentId, account) {
+    const session = getOrCreateAgentSession(agentId);
+    if (session.id) return session;
+
+    if (!sessionCreationPromises.has(agentId)) {
+        const createPromise = (async () => {
+            const agentTag = `[${agentId}] [Acc:${account.id}]`;
+            try {
+                const sr = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
+                    method: 'POST', headers: account.headers, body: '{}'
+                });
+                const srText = await sr.text();
+                if (sr.status === 202 || !srText.trim()) {
+                    throw new Error(`Session creation failed (Status ${sr.status}). DeepSeek returned an empty response. This usually means your session/cookie has expired or is being challenged. Please re-run: node scripts/auth.js`);
+                }
+                let sessionData;
+                try {
+                    sessionData = JSON.parse(srText);
+                } catch (e) {
+                    throw new Error(`Failed to parse session creation JSON: ${e.message}. Status: ${sr.status}`);
+                }
+                const newId = sessionData.data.biz_data.chat_session?.id || sessionData.data.biz_data.id;
+                session.id = newId;
+                session.parentMessageId = null;
+                session.createdAt = Date.now();
+                session.messageCount = 0;
+                console.log(`${agentTag} Created new session: ${newId}`);
+                writeLog(account.id, agentId, 'SESSION-CREATED', { sessionId: newId });
+                return session;
+            } catch (err) {
+                writeLog(account.id, agentId, 'ERROR-SESSION-CREATE', { error: err.message });
+                throw err;
+            }
+        })();
+        sessionCreationPromises.set(agentId, createPromise);
+        try {
+            return await createPromise;
+        } finally {
+            sessionCreationPromises.delete(agentId);
+        }
+    } else {
+        console.log(`[${agentId}] Waiting for session creation...`);
+        return await sessionCreationPromises.get(agentId);
+    }
+}
+
+// === Worker-based POW solver ===
+function solvePOWAsync(challenge, wasmUrl, accountId, headers) {
+    return new Promise((resolve, reject) => {
+        const localPath = path.join(DEEPSEEK_DIR, 'pow.wasm');
+        const worker = new Worker(path.join(__dirname, 'pow-worker.js'));
+        worker.postMessage({ challenge, wasmUrl, accountId, headers, localPath });
+        worker.on('message', (msg) => {
+            if (msg.success) resolve(msg.answer);
+            else reject(new Error(msg.error));
+            worker.terminate();
+        });
+        worker.on('error', (err) => {
+            reject(err);
+            worker.terminate();
+        });
+        // Safety timeout
+        setTimeout(() => {
+            worker.terminate();
+            reject(new Error('POW solver timeout'));
+        }, 30000);
+    });
 }
 
 const MODEL_CONFIGS = {
@@ -340,21 +419,26 @@ function isSupportedModel(model) { return resolveModelConfig(model).supported ==
 async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     const modelCfg = resolveModelConfig(model);
     const session = getOrCreateAgentSession(agentId);
-    const agentTag = `[${agentId}]`;
+    const account = getAccountForAgent(agentId);
+    
+    if (!account) {
+        throw new Error('No available accounts in accountPool. Please run node scripts/auth.js');
+    }
+
+    const agentTag = `[${agentId}] [Acc:${account.id}]`;
 
     // Auto-reset on deep message chain
     if (session.id && session.messageCount >= MAX_MESSAGE_DEPTH) {
-        console.log(`${agentTag} Session ${session.id} hit ${session.messageCount} messages. Auto-resetting.`);
+        console.log(`${agentTag} Session hit depth limit. Auto-resetting.`);
         session.id = null;
         session.parentMessageId = null;
         session.createdAt = null;
         session.messageCount = 0;
-        // History preserved for context injection
     }
 
-    // Reset expired sessions (DeepSeek web sessions last ~1-2 hours)
+    // Reset expired sessions
     if (session.id && session.createdAt && (Date.now() - session.createdAt > SESSION_TTL_MS)) {
-        console.log(`${agentTag} Session ${session.id} expired (age: ${Math.round((Date.now() - session.createdAt) / 60000)}min). Creating new...`);
+        console.log(`${agentTag} Session expired. Creating new...`);
         session.id = null;
         session.parentMessageId = null;
         session.createdAt = null;
@@ -362,7 +446,8 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     }
 
     const cr = await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
-        method: 'POST', headers: BASE_HEADERS,
+        method: 'POST', 
+        headers: account.headers,
         body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
     });
     const crText = await cr.text();
@@ -370,33 +455,13 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     try {
         chalJson = JSON.parse(crText);
     } catch (e) {
-        writeLog(agentId, 'ERROR-POW-JSON', { status: cr.status, text: crText, error: e.message });
+        writeLog(account.id, agentId, 'ERROR-POW-JSON', { status: cr.status, text: crText, error: e.message });
         throw new Error(`Failed to parse POW challenge JSON: ${e.message}. Status: ${cr.status}`);
     }
     const challenge = chalJson.data.biz_data.challenge;
-    const answer = await solvePOW(challenge);
+    const answer = await solvePOWAsync(challenge, 'https://chat.deepseek.com/static/wasm/pro/pow.wasm', account.id, account.headers);
 
-    if (!session.id) {
-        const sr = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
-            method: 'POST', headers: BASE_HEADERS, body: '{}'
-        });
-        const srText = await sr.text();
-        let sessionData;
-        try {
-            sessionData = JSON.parse(srText);
-        } catch (e) {
-            writeLog(agentId, 'ERROR-SESSION-JSON', { status: sr.status, text: srText, error: e.message });
-            throw new Error(`Failed to parse session create JSON: ${e.message}. Status: ${sr.status}`);
-        }
-        session.id = sessionData.data.biz_data.chat_session?.id || sessionData.data.biz_data.id;
-        session.parentMessageId = null;
-        session.createdAt = Date.now();
-        session.messageCount = 0;
-        console.log(`${agentTag} Created new session: ${session.id}`);
-        writeLog(agentId, 'SESSION-CREATED', { sessionId: session.id });
-    } else {
-        console.log(`${agentTag} Reusing session: ${session.id} (parent: ${session.parentMessageId}, msg#${session.messageCount})`);
-    }
+    await ensureAgentSession(agentId, account);
 
     const powB64 = Buffer.from(JSON.stringify({
         algorithm: challenge.algorithm, challenge: challenge.challenge,
@@ -404,7 +469,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
         signature: challenge.signature, target_path: '/api/v0/chat/completion'
     })).toString('base64');
     
-    writeLog(agentId, 'DS-REQUEST', {
+    writeLog(account.id, agentId, 'DS-REQUEST', {
         sessionId: session.id,
         parentMessageId: session.parentMessageId,
         model: modelCfg.real_model,
@@ -413,7 +478,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
 
     const resp = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
         method: 'POST',
-        headers: { ...BASE_HEADERS, 'X-DS-PoW-Response': powB64 },
+        headers: { ...account.headers, 'X-DS-PoW-Response': powB64 },
         body: JSON.stringify({
             chat_session_id: session.id,
             parent_message_id: session.parentMessageId,
@@ -436,14 +501,19 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
             session.messageCount = 0;
 
             const sr2 = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
-                method: 'POST', headers: BASE_HEADERS, body: '{}'
+                method: 'POST', headers: account.headers, body: '{}'
             });
             const sr2Text = await sr2.text();
+            if (sr2.status === 202 || !sr2Text.trim()) {
+                const msg = `Session creation failed (Status ${sr2.status}) for account ${account.id}. DeepSeek returned an empty response. This usually means your session/cookie has expired or is being challenged. Please re-run: node scripts/auth.js`;
+                writeLog(account.id, agentId, 'ERROR-SESSION-RETRY-202', { status: sr2.status, text: sr2Text });
+                throw new Error(msg);
+            }
             let sessionData2;
             try {
                 sessionData2 = JSON.parse(sr2Text);
             } catch (e) {
-                writeLog(agentId, 'ERROR-SESSION-RETRY-JSON', { status: sr2.status, text: sr2Text, error: e.message });
+                writeLog(account.id, agentId, 'ERROR-SESSION-RETRY-JSON', { status: sr2.status, text: sr2Text, error: e.message });
                 throw new Error(`Failed to parse retry session JSON: ${e.message}. Status: ${sr2.status}`);
             }
             session.id = sessionData2.data.biz_data.chat_session?.id || sessionData2.data.biz_data.id;
@@ -458,7 +528,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
             })).toString('base64');
             const resp2 = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
                 method: 'POST',
-                headers: { ...BASE_HEADERS, 'X-DS-PoW-Response': newPowB64 },
+                headers: { ...account.headers, 'X-DS-PoW-Response': newPowB64 },
                 body: JSON.stringify({
                     chat_session_id: session.id,
                     parent_message_id: null,
@@ -468,11 +538,11 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
                     action: null, preempt: false,
                 })
             });
-            return { resp: resp2, agentId };
+            return { resp: resp2, agentId, accountId: account.id };
         }
     }
 
-    return { resp, agentId };
+    return { resp, agentId, accountId: account.id };
 }
 
 // === Tool Calling Support ===
@@ -1068,6 +1138,14 @@ function formatMessages(messages, tools) {
     return { prompt: conversation.trim(), systemPrompt: systemPrompt.trim() };
 }
 
+function hasAuthConfig() {
+    return accountPool.size > 0;
+}
+
+function loadDeepSeekConfig() {
+    loadAccountPool();
+}
+
 // === HTTP Server ===
 const server = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -1168,8 +1246,10 @@ const server = http.createServer(async (req, res) => {
             const bodyParams = JSON.parse(body || '{}');
             const requestedSession = req.headers['x-agent-session'] || bodyParams.session || bodyParams.user || (isLocal ? 'dev-agent' : remoteAddr);
             const agentId = String(requestedSession);
+            const account = getAccountForAgent(agentId);
+            const accountId = account ? account.id : 'no-account';
             
-            writeLog(agentId, 'INCOMING-REQUEST', {
+            writeLog(accountId, agentId, 'INCOMING-REQUEST', {
                 path: cleanPath,
                 headers: req.headers,
                 body: bodyParams
@@ -1180,10 +1260,21 @@ const server = http.createServer(async (req, res) => {
             const tools = params.tools || [];
             const stream = params.stream === true;
             const agentTag = `[${agentId}]`;
+
+            // --- Rate Limiting Check ---
+            const rl = checkRateLimit(agentId);
+            if (rl.limited) {
+                const waitSec = Math.ceil(rl.waitMs / 1000);
+                console.log(`${agentTag} ⏳ Rate limit reached (3 req/min). Waiting ${waitSec}s...`);
+                await new Promise(r => setTimeout(r, rl.waitMs));
+                // Re-log the current request after waiting so it counts for the next window
+                checkRateLimit(agentId); 
+            }
+            // ---------------------------
             
             let requestedModel = String(params.model || 'deepseek-chat').toLowerCase();
             
-            writeLog(agentId, 'MODEL-INFO', { 
+            writeLog(accountId, agentId, 'MODEL-INFO', { 
                 requested_model: requestedModel,
                 is_known: isKnownModel(requestedModel),
                 is_supported: isKnownModel(requestedModel) ? isSupportedModel(requestedModel) : false
@@ -1192,55 +1283,22 @@ const server = http.createServer(async (req, res) => {
             if (!isKnownModel(requestedModel)) {
                 const fallback = 'deepseek-chat';
                 console.log(`[DS-API] ${agentTag} 🔀 Model Mapping: "${requestedModel}" -> "${fallback}" (Unknown model)`);
-                writeLog(agentId, 'MODEL-MAPPING', { from: requestedModel, to: fallback, reason: 'unknown' });
+                writeLog(accountId, agentId, 'MODEL-MAPPING', { from: requestedModel, to: fallback, reason: 'unknown' });
                 requestedModel = fallback;
             } else if (!isSupportedModel(requestedModel)) {
                 const fallback = 'deepseek-chat';
                 const cfg = resolveModelConfig(requestedModel);
                 console.log(`[DS-API] ${agentTag} ⚠️ Model "${requestedModel}" is unsupported (${cfg.unavailable_reason || 'disabled'}). Mapping to "${fallback}"`);
-                writeLog(agentId, 'MODEL-MAPPING', { from: requestedModel, to: fallback, reason: 'unsupported', detail: cfg.unavailable_reason });
+                writeLog(accountId, agentId, 'MODEL-MAPPING', { from: requestedModel, to: fallback, reason: 'unsupported', detail: cfg.unavailable_reason });
                 requestedModel = fallback;
             }
             const { prompt, systemPrompt } = formatMessages(messages, tools);
 
-            const session = getOrCreateAgentSession(agentId);
-
-            // --- Session Creation Lock ---
-            if (!session.id) {
-                if (!sessionCreationPromises.has(agentId)) {
-                    const createPromise = (async () => {
-                        const sr = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
-                            method: 'POST', headers: BASE_HEADERS, body: '{}'
-                        });
-                        const srText = await sr.text();
-                        let sessionData;
-                        try {
-                            sessionData = JSON.parse(srText);
-                        } catch (e) {
-                            writeLog(agentId, 'ERROR-SESSION-CREATE-JSON', { status: sr.status, text: srText, error: e.message });
-                            throw new Error(`Failed to parse session creation JSON: ${e.message}. Status: ${sr.status}`);
-                        }
-                        const newId = sessionData.data.biz_data.chat_session?.id || sessionData.data.biz_data.id;
-                        session.id = newId;
-                        session.parentMessageId = null;
-                        session.createdAt = Date.now();
-                        session.messageCount = 0;
-                        console.log(`${agentTag} Created new session: ${newId}`);
-                        return newId;
-                    })();
-                    sessionCreationPromises.set(agentId, createPromise);
-                    await createPromise;
-                    sessionCreationPromises.delete(agentId);
-                } else {
-                    console.log(`${agentTag} Waiting for session creation...`);
-                    await sessionCreationPromises.get(agentId);
-                }
-            }
-            // -----------------------------
+            const session = await ensureAgentSession(agentId, account);
 
             // Build history prefix if starting fresh
             let historyPrefix = '';
-            if (!session.id && session.history.length > 0) {
+            if (session.messageCount === 0 && session.history.length > 0) {
                 historyPrefix = '[Previous conversation]\n';
                 for (const exchange of session.history) {
                     historyPrefix += `User: ${exchange.user}\nAssistant: ${exchange.assistant}\n\n`;
@@ -1299,7 +1357,7 @@ const server = http.createServer(async (req, res) => {
                                 if (d.type === 'error' || d.finish_reason || d.content) {
                                     modelError = { type: d.type || 'error', content: d.content || '', finish_reason: d.finish_reason || null };
                                     if (d.finish_reason) finishReason = d.finish_reason;
-                                    writeLog(agentId, 'DS-MODEL-ERROR-FRAGMENT', d);
+                                    writeLog(accountId, agentId, 'DS-MODEL-ERROR-FRAGMENT', d);
                                 }
                                 if (d.p !== undefined) lastPath = d.p;
                                 if (d.v && typeof d.v === 'object' && d.v.response) {
@@ -1498,58 +1556,66 @@ const server = http.createServer(async (req, res) => {
                     res.end(JSON.stringify(openaiResponse));
                 }
                 console.log(`${agentTag} Response ${apiMode} (tool=${!!toolCall}, ${elapsed}ms, ${fullContent.length} chars)`);
-                writeLog(agentId, 'OUTGOING-RESPONSE', { mode: apiMode, tool: !!toolCall, elapsed, chars: fullContent.length });
+                writeLog(accountId, agentId, 'OUTGOING-RESPONSE', { mode: apiMode, tool: !!toolCall, elapsed, chars: fullContent.length });
             }
         } catch (e) {
             console.log('[DS-API] Error:', e.message);
-            writeLog('system', 'SERVER-ERROR', { error: e.message, stack: e.stack });
+            writeLog('system', 'system', 'SERVER-ERROR', { error: e.message, stack: e.stack });
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: { message: e.message, type: 'server_error' } }));
         }
     });
 });
 
-async function runAuthScript() {
+async function runAuthScript(suffix = '') {
     const script = path.join(__dirname, 'scripts', 'deepseek_chrome_auth.js');
-    const result = spawnSync(process.execPath, [script], { stdio: 'inherit', env: process.env });
-    loadDeepSeekConfig({ fatal: false });
+    const env = { ...process.env };
+    if (suffix) env.DEEPSEEK_AUTH_SUFFIX = suffix;
+    const result = spawnSync(process.execPath, [script], { stdio: 'inherit', env });
+    loadDeepSeekConfig();
     return result.status === 0 && hasAuthConfig();
 }
 
 function printStatus() {
     console.log(`\n${formatWatermark()}`);
-    console.log(`Auth: ${hasAuthConfig() ? '✅ OK' : '❌ не найден deepseek-auth.json'}`);
-    console.log(`Auth file: ${DS_CONFIG_PATH}`);
-    console.log(`Рабочие модели: ${SUPPORTED_MODEL_IDS.join(', ')}`);
-    console.log('Нерабочие/скрытые aliases: ' + Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported).join(', '));
-    console.log('Capabilities: GET /v1/model-capabilities');
+    console.log(`Аккаунтов загружено: ${accountPool.size}`);
+    if (accountPool.size > 0) {
+        console.log(`Список: ${Array.from(accountPool.keys()).join(', ')}`);
+    } else {
+        console.log(`❌ Аккаунты не найдены в ${DEEPSEEK_DIR}`);
+    }
+    console.log(`Рабочие модели: ${SUPPORTED_MODEL_IDS.length}`);
 }
 
 async function showStartupMenu() {
     if (isTruthy(process.env.SKIP_ACCOUNT_MENU) || isTruthy(process.env.NON_INTERACTIVE)) {
-        if (!hasAuthConfig()) loadDeepSeekConfig({ fatal: true });
-        return true;
+        loadDeepSeekConfig();
+        return hasAuthConfig();
     }
     while (true) {
         printStatus();
-        console.log('1 - Авторизоваться / обновить DeepSeek login');
-        console.log('2 - Показать модели и статусы');
-        console.log('3 - Запустить прокси (по умолчанию)');
-        console.log('4 - Выход');
-        let choice = await prompt('Ваш выбор (Enter = 3): ');
-        if (!choice) choice = '3';
+        console.log('1 - Добавить/обновить основной аккаунт (default)');
+        console.log('2 - Добавить дополнительный аккаунт (с ID)');
+        console.log('3 - Показать модели и статусы');
+        console.log('4 - Запустить сервер (по умолчанию)');
+        console.log('5 - Выход');
+        let choice = await prompt('Ваш выбор (Enter = 4): ');
+        if (!choice) choice = '4';
         if (choice === '1') {
             await runAuthScript();
         } else if (choice === '2') {
+            const id = await prompt('Введите ID для аккаунта (например, acc2): ');
+            if (id) await runAuthScript(id);
+        } else if (choice === '3') {
             console.log(JSON.stringify(ALL_MODEL_CAPABILITIES, null, 2));
             await prompt('\nНажмите Enter, чтобы вернуться в меню...');
-        } else if (choice === '3') {
+        } else if (choice === '4') {
             if (!hasAuthConfig()) {
-                console.log('Нужен deepseek-auth.json. Запустите пункт 1.');
+                console.log('Нужен хотя бы один аккаунт. Запустите пункт 1.');
                 continue;
             }
             return true;
-        } else if (choice === '4') {
+        } else if (choice === '5') {
             return false;
         }
     }

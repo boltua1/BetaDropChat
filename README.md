@@ -80,13 +80,25 @@ DeepSeek часто меняет пути и защиту для своего WA
 
 ---
 
-## 🛠 Интеграция с Claude Code (Windows)
+## 🛠 Интеграция с продуктами Anthropic
 
-Используйте `run-claude.bat` для мгновенного запуска:
+### Claude Desktop (UI)
+Теперь вы можете использовать модели DeepSeek прямо в официальном приложении Claude Desktop:
+1. Зайдите в **Settings** -> **Inference**.
+2. В выпадающем меню выберите **Gateway**.
+3. Заполните поля следующим образом:
+   - **Credential kind**: `Static API key`
+   - **Gateway base URL**: `http://127.0.0.1:9655`
+   - **Gateway API key**: Любая строка (например, `sk-ant-free`)
+   - **Gateway auth scheme**: `bearer`
+4. Нажмите **Test connection** и пользуйтесь!
+
+### Claude Code (CLI)
+Для пользователей Windows реализован скрипт `run-claude.bat`, который максимально упрощает запуск:
 ```bash
 run-claude.bat
 ```
-Скрипт сам запустит прокси в фоне, настроит все переменные окружения и откроет Claude Code.
+Скрипт сам запустит прокси в фоне, настроит `ANTHROPIC_BASE_URL` и откроет Claude Code.
 
 ---
 

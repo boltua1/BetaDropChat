@@ -32,7 +32,18 @@ node server.js
 
 ## 3. Подключение к инструментам
 
-### 🧩 Claude Code (Windows)
+### 🖥️ Claude Desktop (Интерфейс)
+Вы можете использовать DeepSeek прямо в официальном приложении Claude Desktop:
+1.  Откройте **Settings** -> **Inference**.
+2.  Выберите **Gateway** в выпадающем списке.
+3.  Настройте параметры (как на скриншоте):
+    *   **Credential kind:** `Static API key`
+    *   **Gateway base URL:** `http://127.0.0.1:9655`
+    *   **Gateway API key:** Любые символы (например, `sk-ant-123`)
+    *   **Gateway auth scheme:** `bearer`
+4.  Нажмите **Test connection**.
+
+### 🧩 Claude Code (CLI)
 Просто запустите файл `run-claude.bat` в папке проекта. Он сам:
 *   Запустит сервер в фоне.
 *   Настроит мост между Claude и DeepSeek.

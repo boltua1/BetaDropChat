@@ -323,7 +323,7 @@ async function captureWasm(cdp) {
     const evalRes = await cdp.send('Runtime.evaluate', {
       expression: `(async () => {
         const resources = performance.getEntriesByType('resource');
-        const wasmEntry = resources.find(r => r.name.includes('.wasm'));
+        const wasmEntry = resources.find(r => /sha3_wasm.*\.wasm/.test(r.name)) || resources.find(r => /pow.*\.wasm/.test(r.name));
         if (!wasmEntry) {
            return { error: 'no_wasm_found', found_types: resources.map(r => r.name.split('.').pop()).slice(-10) };
         }
@@ -409,17 +409,23 @@ async function main() {
   cdp.on('Network.responseReceived', async (params) => {
     const url = params.response.url;
     
-    if (url.includes('.wasm')) {
+    if (url.includes('sha3_wasm') || url.includes('pow.wasm')) {
       try {
         const { body, base64Encoded } = await cdp.send('Network.getResponseBody', { requestId: params.requestId });
         const buffer = base64Encoded ? Buffer.from(body, 'base64') : Buffer.from(body);
         
-        // Validation: Must be a WASM file (\0asm)
-        if (buffer.length > 10000 && buffer[0] === 0x00 && buffer[1] === 0x61 && buffer[2] === 0x73 && buffer[3] === 0x6d) {
+        // Validation: Must be genuine DeepSeek POW WASM (has wasm_solve)
+        let isValid = false;
+        try {
+          const mod = new WebAssembly.Module(buffer);
+          isValid = WebAssembly.Module.exports(mod).some(e => e.name === 'wasm_solve');
+        } catch (_) {}
+
+        if (isValid) {
           const wasmPath = path.join(repoRoot, '.deepseek', 'pow.wasm');
           if (!fs.existsSync(path.dirname(wasmPath))) fs.mkdirSync(path.dirname(wasmPath), { recursive: true });
           fs.writeFileSync(wasmPath, buffer);
-          console.log(`[auth] ✅ Captured and saved pow.wasm from ${url} (${buffer.length} bytes)`);
+          console.log(`[auth] ✅ Captured and saved genuine pow.wasm from ${url} (${buffer.length} bytes)`);
         }
       } catch (e) {
         // Body might not be available if it's a cache hit or very fast, 

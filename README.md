@@ -1,125 +1,43 @@
-# BetaDropChat
+# BetaDropChat v2.0 (Multi-Provider Edition)
 
 <p align="center">
-  <strong>Универсальный OpenAI/Anthropic API прокси с поддержкой мультиаккаунтов для DeepSeek Web Chat</strong>
+  <strong>Универсальный OpenAI & Anthropic API прокси для DeepSeek Web и Google Gemini Pro (Google One AI Premium)</strong>
 </p>
 
-<p align="center">
-  <a href="https://github.com/boltua1/BetaDropChat/blob/main/LICENSE"><img alt="License MIT" src="https://img.shields.io/badge/license-MIT-green.svg" /></a>
-  <img alt="Node.js 18 plus" src="https://img.shields.io/badge/node-18%2B-339933.svg" />
-  <img alt="No npm dependencies" src="https://img.shields.io/badge/dependencies-0-blue.svg" />
-  <img alt="OpenAI compatible" src="https://img.shields.io/badge/OpenAI-compatible-111111.svg" />
-</p>
+## 🌟 Ключевые возможности
 
-<p align="center">
-  <a href="#-быстрый-старт">Быстрый старт</a> •
-  <a href="#-мультиаккаунтность">Мультиаккаунты</a> •
-  <a href="#-решение-проблем-с-pow-wasm">POW / WASM</a> •
-  <a href="#-возможности">Возможности</a> •
-  <a href="#-интеграция-с-claude-code">Claude Code</a>
-</p>
-
-**BetaDropChat** — это профессиональный прокси-сервер, который превращает бесплатный **DeepSeek Web Chat** (`chat.deepseek.com`) в полноценный локальный API-бэкенд. Проект разработан для бесшовной интеграции DeepSeek в **Claude Code**, **Cursor**, **Open WebUI** и другие инструменты, требующие OpenAI или Anthropic API.
-
----
-
-## 🌟 Ключевые особенности
-
-- **👥 Мультиаккаунтность**: Добавляйте неограниченное количество аккаунтов DeepSeek. Система автоматически распределяет запросы и изолирует сессии.
-- **🛡️ Умный POW (Proof of Work)**: Автоматический захват актуального WASM-файла из браузера. Забудьте об ошибках "Blocked by DeepSeek".
-- **🔄 Синхронизация сессий**: Надежная защита от гонок. При одновременном обращении нескольких агентов (например, в Claude Code) сервер корректно создает и распределяет сессии.
-- **🚀 Полная поддержка R1 (Reasoner)**: Передача `reasoning_content` и корректная работа с моделями рассуждения DeepSeek.
-- **📦 Zero Dependencies**: Работает на стандартной библиотеке Node.js 18+, не требует установки тяжелых зависимостей.
+- 🚀 **Два флагманских провайдера в одном шлюзе**:
+  - **Google Gemini Pro** (Gemini 2.5 Pro с контекстом подписки Google One AI Premium).
+  - **DeepSeek Web** (актуальные модели: `deepseek-flash` с поддержкой vision и кодинга, `deepseek-v4-pro` 1.6T флагман, `deepseek-reasoner` с reasoning).
+- 🖥️ **Поддержка Claude Desktop & Claude Code**: шлюз на `127.0.0.1:9655` принимает запросы Anthropic Messages API (`/v1/messages`) и OpenAI API (`/v1/chat/completions`).
+- 📁 **Изоляция сессий и ключей**:
+  - `.gemini/` — профили и cookie Google.
+  - `.deepseek/` — профили и WASM DeepSeek.
+- 📦 **Zero Dependencies**: чистый Node.js 18+ без сторонних npm-библиотек.
 
 ---
 
 ## ⚡ Быстрый старт
 
-### 1. Установка
+### 1. Авторизация
+Запустите единое меню управления:
 ```bash
-git clone https://github.com/boltua1/BetaDropChat.git
-cd BetaDropChat
+node scripts/auth.js
 ```
+- Нажмите **1** для входа в **Google Gemini Pro**.
+- Нажмите **2** для входа в **DeepSeek**.
 
-### 2. Авторизация и захват POW WASM
-Для работы необходим файл `pow.wasm`, который DeepSeek использует для защиты. Теперь он захватывается автоматически:
+### 2. Запуск через лаунчер (Windows)
+Запустите `run-claude.bat`:
+- Выберите провайдера (Gemini или DeepSeek).
+- Выберите модель (`gemini-4-argon`, `deepseek-flash`, `deepseek-v4-pro`, `deepseek-reasoner`).
+- Лаунчер автоматически запустит сервер на порту 9655 и подключит Claude Code!
 
-1. Запустите скрипт управления аккаунтами:
-   ```bash
-   node scripts/auth.js
-   ```
-2. Выберите **1** (Добавить/обновить аккаунт) и нажмите **Enter**.
-3. В открывшемся окне Chrome войдите в DeepSeek и **отправьте любое сообщение** (например, "ok").
-4. Скрипт перехватит актуальный файл `pow.wasm` и сохранит вашу сессию. 
-5. Браузер закроется автоматически. Повторите для других аккаунтов, если нужно.
-
-### 3. Запуск сервера
-```bash
-node server.js
-```
-Выберите **4** (Запустить сервер). По умолчанию он доступен на `http://127.0.0.1:9655`.
-
----
-
-## 👥 Мультиаккаунтность
-
-BetaDropChat позволяет использовать несколько аккаунтов одновременно. 
-- Каждый аккаунт имеет свой `deepseek-auth-ID.json` и свой изолированный профиль Chrome в папке `.deepseek/`.
-- Вы можете обращаться к конкретному аккаунту через параметр `agent` в URL или используя разные ключи (если настроено).
-- Логи для каждого аккаунта пишутся в отдельные папки: `logs/ГГГГ-ММ-ДД/ID_аккаунта/`.
-
----
-
-## 🛡️ Решение проблем с POW / WASM
-
-DeepSeek часто меняет пути и защиту для своего WASM-файла. В BetaDropChat внедрена трехуровневая система защиты:
-
-1. **Авто-перехват**: Скрипт `auth.js` вытаскивает файл прямо из памяти браузера при авторизации.
-2. **Авто-поиск**: Если файла нет, сервер попытается сам найти актуальную ссылку на сайте DeepSeek.
-3. **Ручной режим**: Если автоматика заблокирована, сервер выведет в консоль **прямую актуальную ссылку** и полный путь, куда нужно сохранить файл.
-
----
-
-## 🛠 Интеграция с продуктами Anthropic
-
-### Claude Desktop (UI)
-Теперь вы можете использовать модели DeepSeek прямо в официальном приложении Claude Desktop:
-1. Зайдите в **Settings** -> **Inference**.
-2. В выпадающем меню выберите **Gateway**.
-3. Заполните поля следующим образом:
-   - **Credential kind**: `Static API key`
+### 3. Подключение к Claude Desktop (GUI)
+1. Откройте **Settings** -> **Inference** (или Developer -> Configure third-party inference).
+2. Выберите **Gateway**.
+3. Параметры:
    - **Gateway base URL**: `http://127.0.0.1:9655`
-   - **Gateway API key**: Любая строка (например, `sk-ant-free`)
+   - **Gateway API key**: любая строка (например, `sk-ant-free`)
    - **Gateway auth scheme**: `bearer`
-4. Нажмите **Test connection** и пользуйтесь!
-
-### Claude Code (CLI)
-Для пользователей Windows реализован скрипт `run-claude.bat`, который максимально упрощает запуск:
-```bash
-run-claude.bat
-```
-Скрипт сам запустит прокси в фоне, настроит `ANTHROPIC_BASE_URL` и откроет Claude Code.
-
----
-
-## ⚙️ Настройки (`settings.json`)
-
-```json
-{
-  "server_port": 9655,           // Порт API сервера
-  "chrome_debug_port": 9334,     // Порт для отладки Chrome
-  "primaryModel": "deepseek-chat" // Модель по умолчанию
-}
-```
-
----
-
-## 🔐 Безопасность и приватность
-
-Все токены, куки и профили браузеров хранятся **только локально** в папке `.deepseek/`. Она добавлена в `.gitignore` и никогда не попадет в сеть.
-
-> ⚠️ **Примечание**: Это экспериментальный инструмент. Для коммерческих задач используйте официальный [DeepSeek API](https://api.deepseek.com/).
-
-<p align="center">
-  <strong>BetaDropChat — Твой мост в мир AI</strong>
-</p>
+4. Нажмите **Test connection**!

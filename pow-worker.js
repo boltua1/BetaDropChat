@@ -24,7 +24,18 @@ async function findCurrentWasmUrl() {
     } catch (e) {
         console.error(`[POW-Discovery] Error: ${e.message}`);
     }
-    return 'https://chat.deepseek.com/static/wasm/pro/pow.wasm'; // Fallback to old known URL
+    return 'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm'; // Reliable fallback
+}
+
+function isValidPowWasm(buffer) {
+    try {
+        if (!buffer || buffer.length < 5000) return false;
+        if (buffer[0] !== 0x00 || buffer[1] !== 0x61 || buffer[2] !== 0x73 || buffer[3] !== 0x6d) return false;
+        const mod = new WebAssembly.Module(buffer);
+        return WebAssembly.Module.exports(mod).some(e => e.name === 'wasm_solve');
+    } catch {
+        return false;
+    }
 }
 
 parentPort.on('message', async (data) => {
@@ -36,15 +47,17 @@ parentPort.on('message', async (data) => {
             // 1. Try local file
             if (localPath && fs.existsSync(localPath)) {
                 const buffer = fs.readFileSync(localPath);
-                if (buffer.length > 10000 && buffer[0] === 0x00 && buffer[1] === 0x61 && buffer[2] === 0x73 && buffer[3] === 0x6d) {
+                if (isValidPowWasm(buffer)) {
                     cachedWasm = buffer;
+                } else {
+                    console.log(`${tag} Local WASM at ${localPath} is invalid or foreign. Re-downloading genuine WASM...`);
                 }
             }
 
-            // 2. Try to discover and download if missing
+            // 2. Try to discover and download if missing or invalid
             if (!cachedWasm) {
                 const activeWasmUrl = await findCurrentWasmUrl();
-                console.log(`${tag} WASM missing. Attempting to download from: ${activeWasmUrl}`);
+                console.log(`${tag} Downloading genuine WASM from: ${activeWasmUrl}`);
                 
                 try {
                     const resp = await fetch(activeWasmUrl, {
@@ -53,12 +66,12 @@ parentPort.on('message', async (data) => {
                     const buf = await resp.arrayBuffer();
                     const nodeBuf = Buffer.from(buf);
                     
-                    if (nodeBuf.length > 10000 && nodeBuf[0] === 0x00) {
+                    if (isValidPowWasm(nodeBuf)) {
                         cachedWasm = nodeBuf;
                         if (localPath) {
                             if (!fs.existsSync(path.dirname(localPath))) fs.mkdirSync(path.dirname(localPath), { recursive: true });
                             fs.writeFileSync(localPath, cachedWasm);
-                            console.log(`${tag} Successfully downloaded and cached WASM.`);
+                            console.log(`${tag} Successfully downloaded and cached genuine DeepSeek POW WASM.`);
                         }
                     }
                 } catch (e) {}

@@ -17,6 +17,8 @@ const path = require('path');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
 const { Worker } = require('worker_threads');
+const GeminiClient = require('./gemini-client');
+const geminiClient = new GeminiClient();
 
 const SERVER_HOST = os.hostname();  // Dynamic hostname detection
 const SERVER_PUBLIC_IP = (() => {
@@ -76,6 +78,7 @@ function writeLog(accountId, agentId, type, data) {
 // === Multi-Account Pool ===
 const DEEPSEEK_DIR = path.join(__dirname, '.deepseek');
 const accountPool = new Map(); // id -> config
+const accountHealth = new Map(); // id -> { errorCount: 0, lastError: 0, retryAfter: 0 }
 
 function buildBaseHeaders(config) {
     return {
@@ -108,6 +111,9 @@ function loadAccountPool() {
             config.headers = buildBaseHeaders(config);
             config.id = id;
             accountPool.set(id, config);
+            if (!accountHealth.has(id)) {
+                accountHealth.set(id, { errorCount: 0, lastError: 0, retryAfter: 0 });
+            }
             console.log(`[DS-API] Loaded account: ${id}`);
         } catch (e) {
             console.error(`[DS-API] Error loading account ${f}: ${e.message}`);
@@ -115,18 +121,55 @@ function loadAccountPool() {
     });
 }
 
-function getAccountForAgent(agentId) {
+function markAccountError(accountId, isRateLimit = false) {
+    const health = accountHealth.get(accountId);
+    if (!health) return;
+    health.errorCount++;
+    health.lastError = Date.now();
+    if (isRateLimit) {
+        health.retryAfter = Date.now() + 65000; // Penalty for 429
+    } else {
+        health.retryAfter = Date.now() + 10000; // Small penalty for other errors
+    }
+}
+
+function markAccountSuccess(accountId) {
+    const health = accountHealth.get(accountId);
+    if (!health) return;
+    health.errorCount = 0;
+    health.retryAfter = 0;
+}
+
+function getAccountForAgent(agentId, skipId = null) {
     if (accountPool.size === 0) return null;
     
-    // Simple Sticky Session: hash agentId to an account index
     const accounts = Array.from(accountPool.values());
+    const now = Date.now();
+
+    // 1. Try to find a healthy account using sticky hash
     let hash = 0;
     for (let i = 0; i < agentId.length; i++) {
         hash = ((hash << 5) - hash) + agentId.charCodeAt(i);
         hash |= 0; 
     }
-    const index = Math.abs(hash) % accounts.length;
-    return accounts[index];
+    
+    const preferredIndex = Math.abs(hash) % accounts.length;
+    const preferredAccount = accounts[preferredIndex];
+    const preferredHealth = accountHealth.get(preferredAccount.id);
+
+    if (preferredAccount.id !== skipId && (!preferredHealth || preferredHealth.retryAfter < now)) {
+        return preferredAccount;
+    }
+
+    // 2. If preferred is "down", pick the first available healthy one
+    for (const acc of accounts) {
+        if (acc.id === skipId) continue;
+        const h = accountHealth.get(acc.id);
+        if (!h || h.retryAfter < now) return acc;
+    }
+
+    // 3. Fallback: pick the one with the earliest retryAfter
+    return accounts.sort((a, b) => (accountHealth.get(a.id)?.retryAfter || 0) - (accountHealth.get(b.id)?.retryAfter || 0))[0];
 }
 
 loadAccountPool();
@@ -160,7 +203,7 @@ const MAX_MESSAGE_DEPTH = 100;
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
 
 // === Rate Limiting ===
-const RATE_LIMIT_COUNT = 3;
+const RATE_LIMIT_COUNT = 20;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const requestLogs = new Map();
 
@@ -185,28 +228,43 @@ function getOrCreateAgentSession(agentId) {
     return sessions.get(agentId);
 }
 
-async function ensureAgentSession(agentId, account) {
+async function ensureAgentSession(agentId, account, retryCount = 0) {
     const session = getOrCreateAgentSession(agentId);
     if (session.id) return session;
 
     if (!sessionCreationPromises.has(agentId)) {
         const createPromise = (async () => {
-            const agentTag = `[${agentId}] [Acc:${account.id}]`;
+            const agentTag = `[${agentId.substring(0, 12)}] [Acc:${account.id}]`;
             try {
                 const sr = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
                     method: 'POST', headers: account.headers, body: '{}'
                 });
-                const srText = await sr.text();
-                if (sr.status === 202 || !srText.trim()) {
-                    throw new Error(`Session creation failed (Status ${sr.status}). DeepSeek returned an empty response. This usually means your session/cookie has expired or is being challenged. Please re-run: node scripts/auth.js`);
+                
+                if (sr.status === 202 || sr.status === 429 || sr.status === 502) {
+                    if (retryCount < 3) {
+                        const delay = Math.min(1000 * (retryCount + 1), 5000);
+                        console.log(`${agentTag} Session creation busy (${sr.status}). Retrying in ${delay}ms...`);
+                        await new Promise(r => setTimeout(r, delay));
+                        sessionCreationPromises.delete(agentId);
+                        return ensureAgentSession(agentId, account, retryCount + 1);
+                    }
                 }
+
+                const srText = await sr.text();
+                if (!srText.trim()) {
+                    throw new Error(`Session creation failed (Empty response). Status: ${sr.status}`);
+                }
+                
                 let sessionData;
                 try {
                     sessionData = JSON.parse(srText);
                 } catch (e) {
                     throw new Error(`Failed to parse session creation JSON: ${e.message}. Status: ${sr.status}`);
                 }
-                const newId = sessionData.data.biz_data.chat_session?.id || sessionData.data.biz_data.id;
+                
+                const newId = sessionData.data?.biz_data?.chat_session?.id || sessionData.data?.biz_data?.id;
+                if (!newId) throw new Error(`Session ID not found in response: ${srText.substring(0, 200)}`);
+                
                 session.id = newId;
                 session.parentMessageId = null;
                 session.createdAt = Date.now();
@@ -226,7 +284,7 @@ async function ensureAgentSession(agentId, account) {
             sessionCreationPromises.delete(agentId);
         }
     } else {
-        console.log(`[${agentId}] Waiting for session creation...`);
+        console.log(`[${agentId.substring(0, 12)}] Waiting for session creation...`);
         return await sessionCreationPromises.get(agentId);
     }
 }
@@ -255,144 +313,324 @@ function solvePOWAsync(challenge, wasmUrl, accountId, headers) {
 }
 
 const MODEL_CONFIGS = {
-    // DeepSeek Web real model_type: default / UI name: "Быстрый".
-    // Public model family: DeepSeek-V3.2-Exp chat mode (fast, no visible reasoning).
-    'deepseek-chat': {
-        model_type: 'default', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek-V4-Flash non-thinking (DeepSeek Web “Быстрый” / default)',
+        // --- Claude-prefixed Gemini Models (Auto-discovered by Claude Desktop) ---
+    'claude-gemini-4-argon': {
+        model_type: 'gemini', thinking_enabled: true, search_enabled: false,
+        real_model: 'Google Gemini 4 Argon (via Claude Desktop)',
+        capabilities: { reasoning: true, web_search: false, files: true },
+        supported: true,
+    },
+    'claude-gemini-3.1-pro': {
+        model_type: 'gemini', thinking_enabled: true, search_enabled: false,
+        real_model: 'Google Gemini 3.1 Pro (via Claude Desktop)',
+        capabilities: { reasoning: true, web_search: false, files: true },
+        supported: true,
+    },
+    'claude-gemini-3.8-flash': {
+        model_type: 'gemini', thinking_enabled: false, search_enabled: false,
+        real_model: 'Google Gemini 3.8 Flash (via Claude Desktop)',
         capabilities: { reasoning: false, web_search: false, files: true },
         supported: true,
     },
-    'deepseek-v3': {
-        model_type: 'default', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek-V4-Flash non-thinking (DeepSeek Web “Быстрый” / default)',
+    'claude-gemini-3.5-flash-lite': {
+        model_type: 'gemini', thinking_enabled: false, search_enabled: false,
+        real_model: 'Google Gemini 3.5 Flash-Lite (via Claude Desktop)',
         capabilities: { reasoning: false, web_search: false, files: true },
         supported: true,
     },
-    'deepseek-default': {
-        model_type: 'default', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek-V4-Flash non-thinking (DeepSeek Web “Быстрый” / default)',
+    'claude-opus-5-5': {
+        model_type: 'gemini', thinking_enabled: true, search_enabled: false,
+        real_model: 'Google Gemini 4 Argon (Opus 5.5 alias)',
+        capabilities: { reasoning: true, web_search: false, files: true },
+        supported: true,
+    },
+    'claude-sonnet-5-5': {
+        model_type: 'gemini', thinking_enabled: true, search_enabled: false,
+        real_model: 'Google Gemini 3.1 Pro (Sonnet 5.5 alias)',
+        capabilities: { reasoning: true, web_search: false, files: true },
+        supported: true,
+    },
+    'claude-haiku-5-5': {
+        model_type: 'gemini', thinking_enabled: false, search_enabled: false,
+        real_model: 'Google Gemini 3.8 Flash (Haiku 5.5 alias)',
         capabilities: { reasoning: false, web_search: false, files: true },
         supported: true,
     },
-    // Same DeepSeek Web default model, but with thinking_enabled=true. UI exposes it as thinking/reasoning mode.
+    'claude-fable-5-1': {
+        model_type: 'gemini', thinking_enabled: true, search_enabled: false,
+        real_model: 'Google Gemini 4 Argon (Fable 5.1 alias)',
+        capabilities: { reasoning: true, web_search: false, files: true },
+        supported: true,
+    },
+    // --- Google Gemini Actual Models (from Web Interface) ---
+    'gemini-4-argon': {
+        model_type: 'gemini', thinking_enabled: true, search_enabled: false,
+        real_model: 'Google Gemini 4 Argon (Сложные задачи / Новинка)',
+        capabilities: { reasoning: true, web_search: false, files: true },
+        supported: true,
+    },
+    'gemini-argon': {
+        model_type: 'gemini', thinking_enabled: true, search_enabled: false,
+        real_model: 'Google Gemini 4 Argon (Сложные задачи / Новинка)',
+        capabilities: { reasoning: true, web_search: false, files: true },
+        supported: true,
+    },
+    'gemini-3.1-pro': {
+        model_type: 'gemini', thinking_enabled: true, search_enabled: false,
+        real_model: 'Google Gemini 3.1 Pro (Расширенные возможности рассуждения)',
+        capabilities: { reasoning: true, web_search: false, files: true },
+        supported: true,
+    },
+    'gemini-pro': {
+        model_type: 'gemini', thinking_enabled: true, search_enabled: false,
+        real_model: 'Google Gemini 3.1 Pro (Расширенные возможности рассуждения)',
+        capabilities: { reasoning: true, web_search: false, files: true },
+        supported: true,
+    },
+    'gemini-3.8-flash': {
+        model_type: 'gemini', thinking_enabled: false, search_enabled: false,
+        real_model: 'Google Gemini 3.8 Flash (All-around help)',
+        capabilities: { reasoning: false, web_search: false, files: true },
+        supported: true,
+    },
+    'gemini-flash': {
+        model_type: 'gemini', thinking_enabled: false, search_enabled: false,
+        real_model: 'Google Gemini 3.8 Flash (All-around help)',
+        capabilities: { reasoning: false, web_search: false, files: true },
+        supported: true,
+    },
+    'gemini-3.5-flash-lite': {
+        model_type: 'gemini', thinking_enabled: false, search_enabled: false,
+        real_model: 'Google Gemini 3.5 Flash-Lite (Самые быстрые ответы)',
+        capabilities: { reasoning: false, web_search: false, files: true },
+        supported: true,
+    },
+    'gemini-lite': {
+        model_type: 'gemini', thinking_enabled: false, search_enabled: false,
+        real_model: 'Google Gemini 3.5 Flash-Lite (Самые быстрые ответы)',
+        capabilities: { reasoning: false, web_search: false, files: true },
+        supported: true,
+    },
+
+    // --- DeepSeek Web Models ---
+    // deepseek-flash: DeepSeek-V4.1-Flash-1017 (быстрая, экономичная, агентные задачи, кодинг, vision)
+    'deepseek-flash': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V4.1-Flash-1017 (быстрая, экономичная, агентные задачи, программирование, vision)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
+        supported: true,
+    },
+    'deepseek-flash-search': {
+        model_type: 'default', thinking_enabled: false, search_enabled: true,
+        real_model: 'DeepSeek-V4.1-Flash-1017 + web search',
+        capabilities: { reasoning: false, web_search: true, files: true, vision: true },
+        supported: true,
+    },
+
+    // deepseek-v4-pro: DeepSeek-V4-Pro-0813 (флагманская 1.6T, глубокие рассуждения, без vision)
+    'deepseek-v4-pro': {
+        model_type: 'expert', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek-V4-Pro-0813 (флагманская 1.6T, глубокие рассуждения, без vision)',
+        capabilities: { reasoning: true, web_search: false, files: true, vision: false },
+        supported: true,
+    },
+    'deepseek-v4-pro-chat': {
+        model_type: 'expert', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V4-Pro-0813 non-thinking mode (без vision)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: false },
+        supported: true,
+    },
+
+    // Reasoning modes
     'deepseek-reasoner': {
         model_type: 'default', thinking_enabled: true, search_enabled: false,
-        real_model: 'DeepSeek-V4-Flash thinking mode (DeepSeek Web “Быстрый” + thinking_enabled)',
-        capabilities: { reasoning: true, web_search: false, files: true },
-        supported: true,
-    },
-    'deepseek-r1': {
-        model_type: 'default', thinking_enabled: true, search_enabled: false,
-        real_model: 'DeepSeek-V4-Flash thinking mode; R1-compatible alias, not a separate R1 model_type in current Web API',
-        capabilities: { reasoning: true, web_search: false, files: true },
-        supported: true,
-    },
-    'deepseek-chat-search': {
-        model_type: 'default', thinking_enabled: false, search_enabled: true,
-        real_model: 'DeepSeek-V4-Flash non-thinking (DeepSeek Web “Быстрый” / default) + web search',
-        capabilities: { reasoning: false, web_search: true, files: true },
-        supported: true,
-    },
-    'deepseek-default-search': {
-        model_type: 'default', thinking_enabled: false, search_enabled: true,
-        real_model: 'DeepSeek-V4-Flash non-thinking (DeepSeek Web “Быстрый” / default) + web search',
-        capabilities: { reasoning: false, web_search: true, files: true },
+        real_model: 'DeepSeek-V4.1-Flash-1017 thinking mode (reasoning)',
+        capabilities: { reasoning: true, web_search: false, files: true, vision: true },
         supported: true,
     },
     'deepseek-reasoner-search': {
         model_type: 'default', thinking_enabled: true, search_enabled: true,
-        real_model: 'DeepSeek-V4-Flash thinking mode + web search',
-        capabilities: { reasoning: true, web_search: true, files: true },
+        real_model: 'DeepSeek-V4.1-Flash-1017 thinking mode + web search',
+        capabilities: { reasoning: true, web_search: true, files: true, vision: true },
+        supported: true,
+    },
+    'deepseek-r1': {
+        model_type: 'default', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek-V4.1-Flash-1017 thinking mode (R1 alias)',
+        capabilities: { reasoning: true, web_search: false, files: true, vision: true },
         supported: true,
     },
     'deepseek-r1-search': {
         model_type: 'default', thinking_enabled: true, search_enabled: true,
-        real_model: 'DeepSeek-V4-Flash thinking mode + web search; R1-compatible alias',
-        capabilities: { reasoning: true, web_search: true, files: true },
+        real_model: 'DeepSeek-V4.1-Flash-1017 thinking mode + web search (R1 alias)',
+        capabilities: { reasoning: true, web_search: true, files: true, vision: true },
         supported: true,
     },
-    // DeepSeek Web UI name: “Эксперт”. Requires current web client headers (x-client-version=2.0.0).
+
+    // Aliases & Legacy names redirected to deepseek-flash (DeepSeek-V4.1-Flash-1017)
+    'deepseek-v4-flash': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V4.1-Flash-1017 (redirected from deepseek-v4-flash)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
+        supported: true,
+    },
+    'deepseek-v4-flash-vision-exp': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V4.1-Flash-1017 (redirected from deepseek-v4-flash-vision-exp)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
+        supported: true,
+    },
+    'deepseek-chat': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V4.1-Flash-1017 (redirected from deepseek-chat)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
+        supported: true,
+    },
+    'deepseek-v3': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V4.1-Flash-1017 (redirected from deepseek-v3)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
+        supported: true,
+    },
+    'deepseek-default': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V4.1-Flash-1017 (redirected from deepseek-default)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
+        supported: true,
+    },
+    'deepseek-chat-search': {
+        model_type: 'default', thinking_enabled: false, search_enabled: true,
+        real_model: 'DeepSeek-V4.1-Flash-1017 + web search',
+        capabilities: { reasoning: false, web_search: true, files: true, vision: true },
+        supported: true,
+    },
+    'deepseek-default-search': {
+        model_type: 'default', thinking_enabled: false, search_enabled: true,
+        real_model: 'DeepSeek-V4.1-Flash-1017 + web search',
+        capabilities: { reasoning: false, web_search: true, files: true, vision: true },
+        supported: true,
+    },
     'deepseek-expert': {
-        model_type: 'expert', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek Web “Эксперт” (limited resources)',
-        capabilities: { reasoning: false, web_search: false, files: false },
+        model_type: 'expert', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek-V4-Pro-0813 (DeepSeek Web “Эксперт” / 1.6T, без vision)',
+        capabilities: { reasoning: true, web_search: false, files: true, vision: false },
         supported: true,
     },
-    'deepseek-v4-pro': {
-        model_type: 'expert', thinking_enabled: true, search_enabled: false,
-        real_model: 'DeepSeek Web “Эксперт” + thinking mode (exposed as deepseek-v4-pro alias)',
-        capabilities: { reasoning: true, web_search: false, files: false },
+    'deepseek-vision': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V4.1-Flash-1017 (vision enabled)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
         supported: true,
     },
     'deepseek-expert-search': {
         model_type: 'expert', thinking_enabled: false, search_enabled: true,
-        real_model: 'DeepSeek Web “Эксперт” + search requested, but Expert has search_feature=null in remote config',
-        capabilities: { reasoning: false, web_search: false, files: false },
+        real_model: 'DeepSeek-V4-Pro-0813 + search requested, but Expert has search_feature=null in remote config',
+        capabilities: { reasoning: false, web_search: false, files: false, vision: false },
         supported: false,
         unavailable_reason: 'Expert mode is rejected; remote config says search is not available for Expert.',
-    },
-    'deepseek-vision': {
-        model_type: 'vision', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek Web “Распознавание” / image understanding beta',
-        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
-        supported: false,
-        unavailable_reason: 'Current Web API returns: Vision is temporarily unavailable (backend_err_by_model).',
     },
 
     // --- Anthropic Model Aliases (for Claude Code / Claude Desktop compatibility) ---
     'claude-3-5-sonnet-20240620': {
         model_type: 'default', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek-V3 (Anthropic Sonnet alias)',
-        capabilities: { reasoning: false, web_search: false, files: true },
+        real_model: 'DeepSeek-V4.1-Flash-1017 (Anthropic Sonnet alias)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
         supported: true,
     },
     'claude-3-5-sonnet-20241022': {
         model_type: 'default', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek-V3 (Anthropic Sonnet alias)',
-        capabilities: { reasoning: false, web_search: false, files: true },
+        real_model: 'DeepSeek-V4.1-Flash-1017 (Anthropic Sonnet alias)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
         supported: true,
     },
     'claude-3-5-sonnet-latest': {
         model_type: 'default', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek-V3 (Anthropic Sonnet alias)',
-        capabilities: { reasoning: false, web_search: false, files: true },
+        real_model: 'DeepSeek-V4.1-Flash-1017 (Anthropic Sonnet alias)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
         supported: true,
     },
     'claude-3-7-sonnet-20250219': {
         model_type: 'default', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek-V3 (Anthropic Sonnet 3.7 alias)',
-        capabilities: { reasoning: false, web_search: false, files: true },
+        real_model: 'DeepSeek-V4.1-Flash-1017 (Anthropic Sonnet 3.7 alias)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
         supported: true,
     },
     'claude-3-opus-20240229': {
-        model_type: 'default', thinking_enabled: true, search_enabled: false,
-        real_model: 'DeepSeek-R1 (Anthropic Opus alias)',
-        capabilities: { reasoning: true, web_search: false, files: true },
+        model_type: 'expert', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek-V4-Pro-0813 (Anthropic Opus alias)',
+        capabilities: { reasoning: true, web_search: false, files: true, vision: false },
         supported: true,
     },
     'claude-3-haiku-20240307': {
         model_type: 'default', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek-V3 (Anthropic Haiku alias)',
-        capabilities: { reasoning: false, web_search: false, files: true },
+        real_model: 'DeepSeek-V4.1-Flash-1017 (Anthropic Haiku alias)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
         supported: true,
     },
     'claude-3-5-haiku-20241022': {
         model_type: 'default', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek-V3 (Anthropic Haiku 3.5 alias)',
-        capabilities: { reasoning: false, web_search: false, files: true },
+        real_model: 'DeepSeek-V4.1-Flash-1017 (Anthropic Haiku 3.5 alias)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
         supported: true,
     },
     'claude-4-5-20251001': {
-        model_type: 'default', thinking_enabled: true, search_enabled: false,
-        real_model: 'DeepSeek-R1 (Anthropic Claude 4.5 alias)',
-        capabilities: { reasoning: true, web_search: false, files: true },
+        model_type: 'expert', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek-V4-Pro-0813 (Anthropic Claude 4.5 alias)',
+        capabilities: { reasoning: true, web_search: false, files: true, vision: false },
         supported: true,
     },
     'claude-4-8': {
-        model_type: 'default', thinking_enabled: true, search_enabled: false,
-        real_model: 'DeepSeek-R1 (Anthropic Claude 4.8 alias)',
-        capabilities: { reasoning: true, web_search: false, files: true },
+        model_type: 'expert', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek-V4-Pro-0813 (Anthropic Claude 4.8 alias)',
+        capabilities: { reasoning: true, web_search: false, files: true, vision: false },
+        supported: true,
+    },
+    'sonnet-5-5': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V4.1-Flash-1017 (Anthropic Sonnet 5.5 alias)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
+        supported: true,
+    },
+    'claude-5-5-sonnet': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V4.1-Flash-1017 (Anthropic Sonnet 5.5 alias)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
+        supported: true,
+    },
+    'haiku-5-5': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V4.1-Flash-1017 (Anthropic Haiku 5.5 alias)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
+        supported: true,
+    },
+    'claude-5-5-haiku': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V4.1-Flash-1017 (Anthropic Haiku 5.5 alias)',
+        capabilities: { reasoning: false, web_search: false, files: true, vision: true },
+        supported: true,
+    },
+    'opus-5-5': {
+        model_type: 'expert', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek-V4-Pro-0813 (Anthropic Opus 5.5 alias)',
+        capabilities: { reasoning: true, web_search: false, files: true, vision: false },
+        supported: true,
+    },
+    'claude-5-5-opus': {
+        model_type: 'expert', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek-V4-Pro-0813 (Anthropic Opus 5.5 alias)',
+        capabilities: { reasoning: true, web_search: false, files: true, vision: false },
+        supported: true,
+    },
+    'fable-5-1': {
+        model_type: 'expert', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek-V4-Pro-0813 (Anthropic Fable 5.1 alias)',
+        capabilities: { reasoning: true, web_search: false, files: true, vision: false },
+        supported: true,
+    },
+    'claude-5-1-fable': {
+        model_type: 'expert', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek-V4-Pro-0813 (Anthropic Fable 5.1 alias)',
+        capabilities: { reasoning: true, web_search: false, files: true, vision: false },
         supported: true,
     },
 };
@@ -410,22 +648,28 @@ const ALL_MODEL_CAPABILITIES = Object.fromEntries(Object.entries(MODEL_CONFIGS).
 }]));
 
 function resolveModelConfig(model) {
-    const requested = String(model || 'deepseek-chat').toLowerCase();
-    return MODEL_CONFIGS[requested] || MODEL_CONFIGS['deepseek-chat'];
+    const requested = String(model || 'deepseek-flash').toLowerCase();
+    // Redirect old names specifically if requested
+    if (requested === 'deepseek-v4-flash' || requested === 'deepseek-v4-flash-vision-exp') {
+        return MODEL_CONFIGS['deepseek-flash'];
+    }
+    return MODEL_CONFIGS[requested] || MODEL_CONFIGS['deepseek-flash'];
 }
 function isKnownModel(model) { return Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, String(model || '').toLowerCase()); }
 function isSupportedModel(model) { return resolveModelConfig(model).supported === true; }
 
-async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
+async function askDeepSeekStream(prompt, agentId, model = 'deepseek-flash', attempt = 0, skipId = null) {
     const modelCfg = resolveModelConfig(model);
     const session = getOrCreateAgentSession(agentId);
-    const account = getAccountForAgent(agentId);
+    
+    // Pick a healthy account. If attempt > 0, it will try to find a different one.
+    const account = getAccountForAgent(agentId, skipId);
     
     if (!account) {
         throw new Error('No available accounts in accountPool. Please run node scripts/auth.js');
     }
 
-    const agentTag = `[${agentId}] [Acc:${account.id}]`;
+    const agentTag = `[${agentId.substring(0, 12)}] [Acc:${account.id}]`;
 
     // Auto-reset on deep message chain
     if (session.id && session.messageCount >= MAX_MESSAGE_DEPTH) {
@@ -445,104 +689,111 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
         session.messageCount = 0;
     }
 
-    const cr = await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
-        method: 'POST', 
-        headers: account.headers,
-        body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
-    });
-    const crText = await cr.text();
-    let chalJson;
     try {
-        chalJson = JSON.parse(crText);
-    } catch (e) {
-        writeLog(account.id, agentId, 'ERROR-POW-JSON', { status: cr.status, text: crText, error: e.message });
-        throw new Error(`Failed to parse POW challenge JSON: ${e.message}. Status: ${cr.status}`);
-    }
-    const challenge = chalJson.data.biz_data.challenge;
-    const answer = await solvePOWAsync(challenge, 'https://chat.deepseek.com/static/wasm/pro/pow.wasm', account.id, account.headers);
+        const cr = await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
+            method: 'POST', 
+            headers: account.headers,
+            body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
+        });
 
-    await ensureAgentSession(agentId, account);
-
-    const powB64 = Buffer.from(JSON.stringify({
-        algorithm: challenge.algorithm, challenge: challenge.challenge,
-        salt: challenge.salt, answer: answer,
-        signature: challenge.signature, target_path: '/api/v0/chat/completion'
-    })).toString('base64');
-    
-    writeLog(account.id, agentId, 'DS-REQUEST', {
-        sessionId: session.id,
-        parentMessageId: session.parentMessageId,
-        model: modelCfg.real_model,
-        prompt: prompt.substring(0, 500) + (prompt.length > 500 ? '...' : '')
-    });
-
-    const resp = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
-        method: 'POST',
-        headers: { ...account.headers, 'X-DS-PoW-Response': powB64 },
-        body: JSON.stringify({
-            chat_session_id: session.id,
-            parent_message_id: session.parentMessageId,
-            model_type: modelCfg.model_type,
-            prompt: prompt, ref_file_ids: [],
-            thinking_enabled: modelCfg.thinking_enabled, search_enabled: modelCfg.search_enabled,
-            action: null, preempt: false,
-        })
-    });
-
-    // If session expired, reset and retry once
-    if (resp.status !== 200) {
-        const errText = await resp.text();
-        console.log(`${agentTag} Session error (${resp.status}): ${errText.substring(0, 100)}`);
-        if (resp.status === 400 || resp.status === 404 || resp.status === 500) {
-            console.log(`${agentTag} Session ${session.id} expired. Creating new session...`);
-            session.id = null;
-            session.parentMessageId = null;
-            session.createdAt = null;
-            session.messageCount = 0;
-
-            const sr2 = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
-                method: 'POST', headers: account.headers, body: '{}'
-            });
-            const sr2Text = await sr2.text();
-            if (sr2.status === 202 || !sr2Text.trim()) {
-                const msg = `Session creation failed (Status ${sr2.status}) for account ${account.id}. DeepSeek returned an empty response. This usually means your session/cookie has expired or is being challenged. Please re-run: node scripts/auth.js`;
-                writeLog(account.id, agentId, 'ERROR-SESSION-RETRY-202', { status: sr2.status, text: sr2Text });
-                throw new Error(msg);
+        if (cr.status === 429 || cr.status === 502 || cr.status === 503 || cr.status === 202) {
+            console.log(`${agentTag} Account error ${cr.status} during challenge creation. Marking account as unhealthy.`);
+            markAccountError(account.id, cr.status === 429);
+            if (attempt < 3 && !session.parentMessageId) {
+                console.log(`${agentTag} Retrying with another account (attempt ${attempt + 1})...`);
+                return askDeepSeekStream(prompt, agentId, model, attempt + 1, account.id);
             }
-            let sessionData2;
-            try {
-                sessionData2 = JSON.parse(sr2Text);
-            } catch (e) {
-                writeLog(account.id, agentId, 'ERROR-SESSION-RETRY-JSON', { status: sr2.status, text: sr2Text, error: e.message });
-                throw new Error(`Failed to parse retry session JSON: ${e.message}. Status: ${sr2.status}`);
-            }
-            session.id = sessionData2.data.biz_data.chat_session?.id || sessionData2.data.biz_data.id;
-            session.parentMessageId = null;
-            session.createdAt = Date.now();
-            console.log(`${agentTag} Created new session: ${session.id}`);
-
-            const newPowB64 = Buffer.from(JSON.stringify({
-                algorithm: challenge.algorithm, challenge: challenge.challenge,
-                salt: challenge.salt, answer: answer,
-                signature: challenge.signature, target_path: '/api/v0/chat/completion'
-            })).toString('base64');
-            const resp2 = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
-                method: 'POST',
-                headers: { ...account.headers, 'X-DS-PoW-Response': newPowB64 },
-                body: JSON.stringify({
-                    chat_session_id: session.id,
-                    parent_message_id: null,
-                    model_type: modelCfg.model_type,
-                    prompt: prompt, ref_file_ids: [],
-                    thinking_enabled: modelCfg.thinking_enabled, search_enabled: modelCfg.search_enabled,
-                    action: null, preempt: false,
-                })
-            });
-            return { resp: resp2, agentId, accountId: account.id };
         }
-    }
 
-    return { resp, agentId, accountId: account.id };
+        const crText = await cr.text();
+        if (!crText.trim()) {
+             throw new Error(`POW challenge empty response (Status ${cr.status}). Account ${account.id} might be busy or challenged.`);
+        }
+
+        let chalJson;
+        try {
+            chalJson = JSON.parse(crText);
+        } catch (e) {
+            writeLog(account.id, agentId, 'ERROR-POW-JSON', { status: cr.status, text: crText, error: e.message });
+            throw new Error(`Failed to parse POW challenge JSON: ${e.message}. Status: ${cr.status}`);
+        }
+        
+        const challenge = chalJson.data?.biz_data?.challenge;
+        if (!challenge) {
+            markAccountError(account.id);
+            if (attempt < 3 && !session.parentMessageId) {
+                console.log(`${agentTag} Invalid challenge response. Switching account...`);
+                return askDeepSeekStream(prompt, agentId, model, attempt + 1, account.id);
+            }
+            throw new Error(`DeepSeek challenge missing in response: ${crText.substring(0, 200)}`);
+        }
+
+        const answer = await solvePOWAsync(challenge, 'https://chat.deepseek.com/static/wasm/pro/pow.wasm', account.id, account.headers);
+
+        await ensureAgentSession(agentId, account);
+
+        const powB64 = Buffer.from(JSON.stringify({
+            algorithm: challenge.algorithm, challenge: challenge.challenge,
+            salt: challenge.salt, answer: answer,
+            signature: challenge.signature, target_path: '/api/v0/chat/completion'
+        })).toString('base64');
+        
+        writeLog(account.id, agentId, 'DS-REQUEST', {
+            sessionId: session.id,
+            parentMessageId: session.parentMessageId,
+            model: modelCfg.real_model,
+            prompt: prompt.substring(0, 500) + (prompt.length > 500 ? '...' : '')
+        });
+
+        const resp = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
+            method: 'POST',
+            headers: { ...account.headers, 'X-DS-PoW-Response': powB64 },
+            body: JSON.stringify({
+                chat_session_id: session.id,
+                parent_message_id: session.parentMessageId,
+                model_type: modelCfg.model_type,
+                prompt: prompt, ref_file_ids: [],
+                thinking_enabled: modelCfg.thinking_enabled, search_enabled: modelCfg.search_enabled,
+                action: null, preempt: false,
+            })
+        });
+
+        if (resp.status !== 200) {
+            const errText = await resp.text();
+            console.log(`${agentTag} Request error (${resp.status}): ${errText.substring(0, 100)}`);
+            
+            if (resp.status === 429 || resp.status === 502 || resp.status === 202) {
+                markAccountError(account.id, resp.status === 429);
+                if (attempt < 3 && !session.parentMessageId) {
+                    console.log(`${agentTag} Retrying with different account after ${resp.status}...`);
+                    return askDeepSeekStream(prompt, agentId, model, attempt + 1, account.id);
+                }
+            }
+
+            if (resp.status === 400 || resp.status === 404 || resp.status === 500) {
+                console.log(`${agentTag} Session expired/invalid. Creating new session...`);
+                session.id = null;
+                session.parentMessageId = null;
+                session.createdAt = null;
+                session.messageCount = 0;
+                return askDeepSeekStream(prompt, agentId, model, attempt + 1, skipId);
+            }
+            
+            throw new Error(`DeepSeek API error ${resp.status}: ${errText.substring(0, 200)}`);
+        }
+
+        markAccountSuccess(account.id);
+        return { resp, agentId, accountId: account.id };
+
+    } catch (err) {
+        markAccountError(account.id);
+        console.log(`${agentTag} Connection error: ${err.message}`);
+        if (attempt < 3 && !session.parentMessageId) {
+            console.log(`${agentTag} Retrying with another account...`);
+            return askDeepSeekStream(prompt, agentId, model, attempt + 1, account.id);
+        }
+        throw err;
+    }
 }
 
 // === Tool Calling Support ===
@@ -615,15 +866,21 @@ function coerceToolCallObject(obj) {
 
 function parseJsonToolCandidate(raw, label = 'json') {
     if (!raw) return null;
+    const trimmed = raw.trim();
+    // Quick check: if it doesn't look like JSON, don't even try to parse it.
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return null;
     try {
-        const parsed = JSON.parse(raw);
+        const parsed = JSON.parse(trimmed);
         const tc = coerceToolCallObject(parsed);
         if (tc) {
             console.log(`[parseToolCall] SUCCESS ${label}: ${tc.name} (args=${tc.arguments.length} chars)`);
             return tc;
         }
     } catch (e) {
-        console.log(`[parseToolCall] ${label} JSON.parse failed: ${e.message.substring(0, 100)}`);
+        // Only log failures for candidates that actually looked like JSON
+        if (trimmed.length < 500) {
+            console.log(`[parseToolCall] ${label} JSON.parse failed: ${e.message.substring(0, 100)}`);
+        }
     }
     return null;
 }
@@ -690,7 +947,92 @@ function parseToolCall(text) {
  * to prevent httpx/urlencode crashes when the gateway sends to Telegram.
  */
 function sanitizeContent(text) {
-    return text.replace(/[\ud800-\udfff]/g, '');
+    if (!text || typeof text !== 'string') return '';
+    return text
+        .replace(/[\ud800-\udfff]/g, '')
+        .replace(/https?:\/\/googleusercontent\.com\/(?:lmdx_content|immersive_entry_chip|image_generation_content|youtube_content|map_content|tool_content|[a-z0-9_]+)\/[^\s)\]>"]+/gi, '')
+        .replace(/(?:Your [A-Za-z0-9_ -]+ file is ready\s*\n?)?\[file-tag:\s*code-generated-file-[^\]]+\]\s*\n?/gi, '')
+        .replace(/\[cite:\s*[\d,\s]+\]/gi, '')
+        .replace(/<!--\s*end list\s*-->/gi, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+/**
+ * Wrap a standalone React (.jsx / .tsx) component into a runnable single-file HTML document
+ * (or return raw HTML if already a complete HTML document).
+ */
+function ensureStandaloneHtml(code, fileName = "index.html") {
+    const trimmed = String(code || "").trim();
+    const baseName = String(fileName || "index.html").replace(/\.(?:jsx|tsx|js|ts)$/i, ".html");
+    const htmlFileName = baseName.endsWith(".html") || baseName.endsWith(".htm") ? baseName : baseName + ".html";
+
+    if (/^<!DOCTYPE\s+html|^<html[\s>]/i.test(trimmed)) {
+        return { htmlName: htmlFileName, htmlContent: trimmed };
+    }
+
+    // Check if it looks like a React component
+    if (/\bimport\s+React\b|\bfrom\s+['"]react['"]|\bexport\s+default\s+function\b/i.test(trimmed)) {
+        let transformed = trimmed
+            .replace(/^\s*import\s+React(?:\s*,\s*\{[^}]*\})?\s+from\s+['"]react['"];?\s*$/gm, "")
+            .replace(/^\s*import\s+\{([^}]*)\}\s+from\s+['"]react['"];?\s*$/gm, "const {$1} = React;")
+            .replace(/^\s*import\s+\{([^}]*)\}\s+from\s+['"]lucide-react['"];?\s*$/gm, "const {$1} = window.__LucideReactProxy;")
+            .replace(/^\s*import\s+[^\n;]+from\s+['"][^'"]+['"];?\s*$/gm, "");
+
+        let mainCompName = "App";
+        const expFuncMatch = transformed.match(/export\s+default\s+function\s+([A-Za-z0-9_]+)/);
+        if (expFuncMatch) {
+            mainCompName = expFuncMatch[1];
+            transformed = transformed.replace(/export\s+default\s+function\s+([A-Za-z0-9_]+)/, "function $1");
+        } else {
+            transformed = transformed.replace(/export\s+default\s+/, "const __DefaultExportApp = ");
+            if (transformed.includes("__DefaultExportApp")) mainCompName = "__DefaultExportApp";
+        }
+
+        const htmlDoc = [
+            '<!DOCTYPE html>',
+            '<html lang="ru">',
+            '<head>',
+            '  <meta charset="UTF-8" />',
+            '  <meta name="viewport" content="width=device-width, initial-scale=1.0" />',
+            '  <title>' + htmlFileName.replace(/\.html$/i, '') + '</title>',
+            '  <script src="https://cdn.tailwindcss.com"><\/script>',
+            '  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"><\/script>',
+            '  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"><\/script>',
+            '  <script src="https://unpkg.com/@babel/standalone/babel.min.js"><\/script>',
+            '  <style>html, body, #root { margin: 0; padding: 0; width: 100%; height: 100%; }</style>',
+            '</head>',
+            '<body>',
+            '  <div id="root"></div>',
+            '  <script>',
+            '    window.__LucideReactProxy = new Proxy({}, {',
+            '      get: function(_, prop) {',
+            '        return function LucideIconShim(props) {',
+            '          const size = (props && props.size) || 20;',
+            '          const cls = (props && props.className) || "";',
+            '          return React.createElement("svg", {',
+            '            width: size, height: size, viewBox: "0 0 24 24", fill: "none",',
+            '            stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round",',
+            '            className: cls, style: props && props.style',
+            '          }, React.createElement("circle", { cx: 12, cy: 12, r: 9 }));',
+            '        };',
+            '      }',
+            '    });',
+            '  <\/script>',
+            '  <script type="text/babel">',
+            '    const { useState, useEffect, useRef, useMemo, useCallback, useReducer, createContext, useContext, Fragment } = React;',
+            transformed,
+            '    const __RootElem = document.getElementById("root");',
+            '    const __Root = ReactDOM.createRoot(__RootElem);',
+            '    __Root.render(React.createElement(' + mainCompName + '));',
+            '  <\/script>',
+            '</body>',
+            '</html>'
+        ].join('\n');
+        return { htmlName: htmlFileName, htmlContent: htmlDoc };
+    }
+
+    return { htmlName: fileName, htmlContent: trimmed };
 }
 
 function estimateTokens(text) {
@@ -712,7 +1054,7 @@ function buildUsage(prompt, content, reasoningContent = '') {
     };
 }
 
-function buildToolCallResponse(toolCall, model = 'deepseek-default', prompt = '', reasoningContent = '') {
+function buildToolCallResponse(toolCall, model = 'deepseek-flash', prompt = '', reasoningContent = '') {
     const id = 'call_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
     const message = {
         role: 'assistant',
@@ -740,7 +1082,7 @@ function buildToolCallResponse(toolCall, model = 'deepseek-default', prompt = ''
     };
 }
 
-function buildTextResponse(content, prompt, model = 'deepseek-default', reasoningContent = '') {
+function buildTextResponse(content, prompt, model = 'deepseek-flash', reasoningContent = '') {
     const message = { role: 'assistant', content };
     if (reasoningContent) message.reasoning_content = reasoningContent;
     return {
@@ -758,18 +1100,71 @@ function buildTextResponse(content, prompt, model = 'deepseek-default', reasonin
     };
 }
 
+function extractImagesFromContent(content, collected = []) {
+    if (!content) return collected;
+    if (Array.isArray(content)) {
+        for (const part of content) {
+            extractImagesFromContent(part, collected);
+        }
+        return collected;
+    }
+    if (typeof content === 'object') {
+        if (content.type === 'image' && content.source) {
+            if (content.source.type === 'base64' && content.source.data) {
+                const mediaType = content.source.media_type || 'image/png';
+                const ext = (mediaType.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '') || 'png';
+                collected.push({
+                    mediaType,
+                    data: content.source.data,
+                    name: `image_${collected.length + 1}.${ext}`
+                });
+            }
+        } else if (content.type === 'image_url' || content.type === 'input_image') {
+            const rawUrl = typeof content.image_url === 'string'
+                ? content.image_url
+                : (content.image_url?.url || content.url || '');
+            const dataMatch = String(rawUrl).match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/i);
+            if (dataMatch) {
+                const mediaType = dataMatch[1].toLowerCase();
+                const ext = (mediaType.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '') || 'png';
+                collected.push({
+                    mediaType,
+                    data: dataMatch[2].trim(),
+                    name: `image_${collected.length + 1}.${ext}`
+                });
+            }
+        } else if (content.type === 'tool_result' && content.content) {
+            extractImagesFromContent(content.content, collected);
+        }
+    }
+    return collected;
+}
+
+function normalizeSinglePart(part) {
+    if (part === null || part === undefined) return '';
+    if (typeof part === 'string') return part;
+    if (typeof part !== 'object') return String(part);
+    if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') return part.text || '';
+    if (part.type === 'image' || part.type === 'input_image') return '[Прикреплено изображение]';
+    if (part.type === 'image_url') {
+        const rawUrl = typeof part.image_url === 'string' ? part.image_url : (part.image_url?.url || '');
+        if (String(rawUrl).startsWith('data:')) return '[Прикреплено изображение]';
+        return `[Image: ${rawUrl}]`;
+    }
+    if (part.type === 'tool_result') return `[Tool Result ${part.tool_use_id || ''}]\n${normalizeMessageContent(part.content)}`;
+    if (part.text) return part.text;
+    if (part.content) return normalizeMessageContent(part.content);
+    return JSON.stringify(part);
+}
+
 function normalizeMessageContent(content) {
     if (content === null || content === undefined) return '';
     if (typeof content === 'string') return content;
     if (Array.isArray(content)) {
-        return content.map(part => {
-            if (typeof part === 'string') return part;
-            if (!part || typeof part !== 'object') return '';
-            if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') return part.text || '';
-            if (part.type === 'tool_result') return `[Tool Result ${part.tool_use_id || ''}]\n${normalizeMessageContent(part.content)}`;
-            if (part.type === 'image_url') return `[Image: ${part.image_url?.url || ''}]`;
-            return part.text || part.content || JSON.stringify(part);
-        }).filter(Boolean).join('\n');
+        return content.map(part => normalizeSinglePart(part)).filter(Boolean).join('\n');
+    }
+    if (typeof content === 'object') {
+        return normalizeSinglePart(content);
     }
     return String(content);
 }
@@ -802,9 +1197,9 @@ function normalizeResponsesInput(input) {
     for (const item of input) {
         if (!item || typeof item !== 'object') continue;
         if (item.type === 'message') {
-            messages.push({ role: item.role || 'user', content: normalizeMessageContent(item.content) });
+            messages.push({ role: item.role || 'user', content: normalizeMessageContent(item.content), images: extractImagesFromContent(item.content) });
         } else if (item.role) {
-            messages.push({ role: item.role, content: normalizeMessageContent(item.content) });
+            messages.push({ role: item.role, content: normalizeMessageContent(item.content), images: extractImagesFromContent(item.content) });
         } else if (item.type === 'function_call_output') {
             messages.push({ role: 'tool', tool_call_id: item.call_id, content: item.output || '' });
         } else if (item.type === 'input_text') {
@@ -828,16 +1223,21 @@ function normalizeApiParams(params, apiMode) {
                 }
             } else if (msg.role === 'user' && Array.isArray(msg.content) && msg.content.some(part => part && part.type === 'tool_result')) {
                 for (const part of msg.content) {
-                    if (part && part.type === 'tool_result') messages.push({ role: 'tool', tool_call_id: part.tool_use_id, content: normalizeMessageContent(part.content) });
-                    else messages.push({ role: 'user', content: normalizeMessageContent(part) });
+                    const partImages = extractImagesFromContent(part);
+                    if (part && part.type === 'tool_result') {
+                        messages.push({ role: 'tool', tool_call_id: part.tool_use_id, content: normalizeMessageContent(part.content), images: partImages });
+                    } else {
+                        messages.push({ role: 'user', content: normalizeMessageContent(part), images: partImages });
+                    }
                 }
             } else {
-                messages.push({ role: msg.role || 'user', content: normalizeMessageContent(msg.content) });
+                const msgImages = extractImagesFromContent(msg.content);
+                messages.push({ role: msg.role || 'user', content: normalizeMessageContent(msg.content), images: msgImages });
             }
         }
         return {
             ...params,
-            model: params.model || 'deepseek-chat',
+            model: params.model || 'deepseek-flash',
             messages,
             tools: normalizeAnthropicTools(params.tools || []),
             stream: params.stream === true,
@@ -849,12 +1249,19 @@ function normalizeApiParams(params, apiMode) {
         if (params.instructions) messages.unshift({ role: 'system', content: params.instructions });
         return {
             ...params,
-            model: params.model || 'deepseek-chat',
+            model: params.model || 'deepseek-flash',
             messages,
             tools: normalizeResponsesTools(params.tools || []),
             stream: params.stream === true,
             user: params.user,
         };
+    }
+    if (Array.isArray(params.messages)) {
+        params.messages = params.messages.map(m => ({
+            ...m,
+            images: (m.images && m.images.length > 0) ? m.images : extractImagesFromContent(m.content),
+            content: typeof m.content === 'string' ? m.content : normalizeMessageContent(m.content)
+        }));
     }
     return params;
 }
@@ -1138,8 +1545,187 @@ function formatMessages(messages, tools) {
     return { prompt: conversation.trim(), systemPrompt: systemPrompt.trim() };
 }
 
+
+// Compact prompt builder specifically for Google Gemini Web
+// Supports both full-history initialization and lightweight single-turn delta continuation for bound Gemini sessions
+function formatMessagesForGemini(messages, tools) {
+    const POISON_PATTERNS = [
+        "i'm having a hard time fulfilling your request",
+        "i encountered an error doing what you asked",
+        "sorry, something went wrong",
+        "i seem to be encountering an error",
+        "i can't help with that right now"
+    ];
+
+    let detectedCwd = "";
+    const cleanedMessages = [];
+    const allExtractedImages = [];
+    for (const msg of messages) {
+        if (msg.role === 'system') {
+            const sysText = String(msg.content || "");
+            const cwdMatch = sysText.match(/Primary working directory:\s*([^\r\n]+)/i)
+                || sysText.match(/Working directory:\s*([^\r\n]+)/i);
+            if (cwdMatch && cwdMatch[1]) {
+                detectedCwd = cwdMatch[1].trim();
+            }
+            continue;
+        }
+        if (Array.isArray(msg.images) && msg.images.length > 0) {
+            for (const img of msg.images) {
+                allExtractedImages.push(img);
+            }
+        }
+        let clean = String(msg.content || '')
+            .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
+            .replace(/<total_tokens>[\s\S]*?<\/total_tokens>/gi, '')
+            .replace(/\[Your previous response had no visible output\.[^\]]*\]/gi, '')
+            .replace(/https?:\/\/googleusercontent\.com\/[^\s)\]>"]+/gi, '')
+            .replace(/(?:Your [A-Za-z0-9_ -]+ file is ready\s*\n?)?\[file-tag:\s*code-generated-file-[^\]]+\]\s*\n?/gi, '')
+            .replace(/\[cite:\s*[\d,\s]+\]/gi, '')
+            .trim();
+
+        if (msg.role === 'assistant' && clean) {
+            const lower = clean.toLowerCase();
+            if (POISON_PATTERNS.some(p => lower.includes(p))) {
+                continue;
+            }
+        }
+
+        if (!clean && (!msg.tool_calls || msg.tool_calls.length === 0) && (!msg.images || msg.images.length === 0)) continue;
+        cleanedMessages.push({ ...msg, cleanContent: clean });
+    }
+
+    const isSuggestionMode = cleanedMessages.length > 0 && String(cleanedMessages[cleanedMessages.length - 1].cleanContent || "").includes("[SUGGESTION MODE:");
+    const recentImages = isSuggestionMode ? [] : allExtractedImages.slice(-4);
+
+    // Compute fingerprint from the first user message in the conversation so session binding survives session ID changes
+    const firstUserMsg = cleanedMessages.find(m => m.role === 'user' && m.cleanContent);
+    const fingerprint = firstUserMsg ? GeminiClient.computeConversationFingerprint(firstUserMsg.cleanContent) : '';
+
+    // Find the last assistant message index to compute deltaPrompt & deltaImages for bound Gemini sessions
+    let lastAssistantIdx = -1;
+    for (let i = cleanedMessages.length - 1; i >= 0; i--) {
+        if (cleanedMessages[i].role === 'assistant') {
+            lastAssistantIdx = i;
+            break;
+        }
+    }
+
+    const deltaMessages = lastAssistantIdx >= 0
+        ? cleanedMessages.slice(lastAssistantIdx + 1)
+        : cleanedMessages;
+    const deltaImages = [];
+    if (!isSuggestionMode) {
+        for (const dm of deltaMessages) {
+            if (Array.isArray(dm.images) && dm.images.length > 0) {
+                deltaImages.push(...dm.images);
+            }
+        }
+    }
+
+    let conversation = '';
+    let lastUserText = '';
+    for (const msg of cleanedMessages) {
+        if (msg.role === 'user') {
+            lastUserText = msg.cleanContent;
+            conversation += 'Пользователь: ' + msg.cleanContent + '\n\n';
+        } else if (msg.role === 'assistant') {
+            if (msg.tool_calls && msg.tool_calls.length > 0) {
+                for (const tc of msg.tool_calls) {
+                    conversation += 'Ассистент: {"tool_call":{"name":"' + tc.function.name + '","arguments":' + tc.function.arguments + '}}\n\n';
+                }
+            } else if (msg.cleanContent) {
+                conversation += 'Ассистент: ' + msg.cleanContent + '\n\n';
+            }
+        } else if (msg.role === 'tool') {
+            const trunc = msg.cleanContent.length > 5000 ? msg.cleanContent.substring(0, 5000) + '\n...[truncated]' : msg.cleanContent;
+            conversation += 'Результат инструмента:\n' + trunc + '\n\n';
+        }
+    }
+
+    if (conversation.length > 18000) {
+        conversation = '...(предыдущая история сокращена)...\n' + conversation.slice(-18000);
+    }
+
+    // Build delta text (only the new turn since the last assistant reply) for bound Gemini sessions
+    let deltaText = '';
+    for (const dm of deltaMessages) {
+        if (dm.role === 'user' && dm.cleanContent) {
+            deltaText += (deltaMessages.length > 1 ? 'Пользователь: ' : '') + dm.cleanContent + '\n\n';
+        } else if (dm.role === 'tool' && dm.cleanContent) {
+            const trunc = dm.cleanContent.length > 5000 ? dm.cleanContent.substring(0, 5000) + '\n...[truncated]' : dm.cleanContent;
+            deltaText += 'Результат выполнения инструмента:\n' + trunc + '\n\n';
+        }
+    }
+    deltaText = deltaText.trim() || lastUserText;
+
+    const antiCanvasRules = [
+        'КРИТИЧЕСКИЕ ПРАВИЛА СРЕДЫ CLAUDE DESKTOP (ПЕРЕОПРЕДЕЛЕНИЕ ВЕБ-РЕЖИМА):',
+        '1. Ты работаешь через API внутри приложения Claude Desktop на ПК пользователя, а НЕ на сайте gemini.google.com.',
+        '2. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать теги <immersive> и </immersive> (Gemini Canvas / immersive_entry_chip) — в Claude Desktop они вырезаются и пользователь НЕ УВИДИТ код из Canvas!',
+        '3. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО запускать внутренний Python-интерпретатор Google (python?code_reference) для сохранения файлов и генерации [file-tag: code-generated-file-...] — эта ссылка не работает вне сайта gemini.google.com!',
+        '4. Если пользователь просит создать сайт, приложение, анимацию, верстку или просит «упаковать / прислать файл», выведи ПОЛНЫЙ самодостаточный код файла прямо в своём ответе внутри тегов <file_write path="finsmith_craft_koi.html">\n<!DOCTYPE html>...\n</file_write> (единым готовым HTML-файлом со всеми встроенными стилями и скриптами, БЕЗ тегов <immersive>), и прокси-сервер автоматически сохранит этот файл на компьютер пользователя и откроет превью в Claude Desktop!'
+    ].join('\n');
+
+    const plainPrompt = 'Ты — умный ИИ-ассистент и помощник по программированию Google Gemini (подключённый через BetaDropChat в Claude Code / Claude Desktop). Отвечай по-русски, дружелюбно, чётко и по делу.\n\n' + antiCanvasRules + '\n\n' + conversation.trim();
+
+    const hasPriorToolTurns = cleanedMessages.some(m => m.role === 'tool' || (m.tool_calls && m.tool_calls.length > 0));
+    const isSimpleGreeting = !hasPriorToolTurns && recentImages.length === 0 && lastUserText.length < 55 && /^(?:привет|здравствуй|здравствуйте|добрый день|доброе утро|добрый вечер|хай|хелло|hi|hello|hey|как дела|ты тут|кто ты)[?!.,\s]*$/i.test(lastUserText.trim());
+
+    // Compact reminder appended to deltaPrompt when continuing an existing Gemini session on coding/file tasks
+    const deltaPrompt = isSimpleGreeting
+        ? deltaText
+        : deltaText + '\n\n[Напоминание среды Claude Desktop: НЕ используй <immersive> (Canvas) и НЕ запускай Python для [file-tag]. Для создания или отправки файла/сайта выведи полный код внутри <file_write path="имя_файла.html">...</file_write> либо вызови инструмент JSON {"tool_call":{"name":"...","arguments":{...}}}]';
+
+    if (isSimpleGreeting || !tools || tools.length === 0) {
+        return { fullPrompt: plainPrompt, plainPrompt, deltaPrompt, images: recentImages, deltaImages, detectedCwd, fingerprint, lastUserText };
+    }
+
+    const CORE_TOOLS = {
+        'Read': 'Read(file_path, offset, limit) — чтение файла по абсолютному пути',
+        'Write': 'Write(file_path, content) — запись/создание файла на диске пользователя',
+        'Edit': 'Edit(file_path, old_string, new_string) — замена фрагмента текста в файле',
+        'Glob': 'Glob(pattern, path) — поиск файлов по маске (например "**/*.js")',
+        'Grep': 'Grep(pattern, path, glob) — поиск текста/регулярки внутри файлов',
+        'Bash': 'Bash(command, description) — выполнение команды в терминале',
+        'PowerShell': 'PowerShell(command, description) — выполнение команды PowerShell',
+        'SendUserFile': 'SendUserFile(files, status, display, caption) — отправить и показать готовый локальный файл пользователю в Claude Desktop (files: ["путь"], status: "normal", display: "render" для HTML/превью или "attach" для скачивания)',
+        'WebSearch': 'WebSearch(query) — поиск информации в интернете',
+        'WebFetch': 'WebFetch(url, prompt) — чтение веб-страницы по URL'
+    };
+
+    const availableLines = [];
+    for (const t of tools) {
+        const name = t.function?.name || t.name;
+        if (name && CORE_TOOLS[name]) {
+            availableLines.push('- ' + CORE_TOOLS[name]);
+        }
+    }
+
+    if (availableLines.length === 0) {
+        return { fullPrompt: plainPrompt, plainPrompt, deltaPrompt, images: recentImages, deltaImages, detectedCwd, fingerprint, lastUserText };
+    }
+
+    let toolHeader = 'Ты — ИИ-ассистент разработчика Google Gemini в среде Claude Desktop / Claude Code' + (detectedCwd ? ' (рабочая директория: ' + detectedCwd + ')' : '') + '. Отвечай по-русски.\n';
+    toolHeader += antiCanvasRules + '\n\n';
+    toolHeader += 'Если нужно прочитать/изменить файл проекта или выполнить команду в терминале, выведи ТОЛЬКО один JSON-объект без лишнего текста:\n';
+    toolHeader += '{"tool_call":{"name":"ИмяИнструмента","arguments":{...}}}\n\n';
+    toolHeader += 'Доступные инструменты проекта:\n' + availableLines.join('\n') + '\n\n';
+
+    return {
+        fullPrompt: toolHeader + conversation.trim(),
+        plainPrompt,
+        deltaPrompt,
+        images: recentImages,
+        deltaImages,
+        detectedCwd,
+        fingerprint,
+        lastUserText
+    };
+}
+
 function hasAuthConfig() {
-    return accountPool.size > 0;
+    return accountPool.size > 0 || (typeof geminiClient !== 'undefined' && geminiClient.isReady());
 }
 
 function loadDeepSeekConfig() {
@@ -1179,20 +1765,24 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Sessions status
+    // Sessions status (includes both DeepSeek and bound Gemini Web sessions)
     if (req.method === 'GET' && cleanPath === '/v1/sessions') {
         const agentList = [];
+        const geminiStore = geminiClient.loadSessionStore();
         for (const [agentId, session] of sessions) {
+            const gemBind = geminiStore.byAgentId[agentId] || null;
             agentList.push({
                 agent: agentId,
-                session_id: session.id,
-                message_count: session.messageCount,
+                session_id: gemBind ? gemBind.convId : session.id,
+                gemini_url: gemBind ? gemBind.url : null,
+                gemini_resp_id: gemBind ? gemBind.respId : null,
+                message_count: gemBind ? gemBind.turnCount : session.messageCount,
                 history_size: session.history.length,
                 age_min: session.createdAt ? Math.round((Date.now() - session.createdAt) / 60000) : 0,
             });
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ agents: agentList, total: agentList.length }));
+        res.end(JSON.stringify({ agents: agentList, gemini_sessions: geminiStore.byConvId, total: agentList.length }));
         return;
     }
 
@@ -1202,14 +1792,17 @@ const server = http.createServer(async (req, res) => {
         if (agentId === 'all') {
             const count = sessions.size;
             sessions.clear();
+            geminiClient.sessionStore = { byAgentId: {}, byFingerprint: {}, byConvId: {}, lastActiveConvId: null };
+            geminiClient.saveSessionStore();
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'all_sessions_cleared', count }));
             return;
         }
+        geminiClient.clearSessionBinding(agentId);
         const session = sessions.get(agentId);
         if (!session) {
-            res.writeHead(404, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: `No session for agent: ${agentId}` }));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'gemini_session_reset', agent: agentId }));
             return;
         }
         const historyCount = session.history.length;
@@ -1226,9 +1819,9 @@ const server = http.createServer(async (req, res) => {
     const apiMode = cleanPath === '/v1/messages'
         ? 'anthropic'
         : (cleanPath === '/v1/responses' ? 'responses' : 'openai');
-    const acceptedPostPaths = ['/v1/chat/completions', '/v1/messages', '/v1/responses'];
+    const acceptedPostPaths = ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/messages/count_tokens'];
     
-    if (req.method === 'POST') {
+    if (req.method === 'POST' && !cleanPath.endsWith('/count_tokens')) {
         console.log(`[DS-API] POST ${cleanPath} (Mode: ${apiMode})`);
     }
 
@@ -1244,11 +1837,40 @@ const server = http.createServer(async (req, res) => {
         
         try {
             const bodyParams = JSON.parse(body || '{}');
-            const requestedSession = req.headers['x-agent-session'] || bodyParams.session || bodyParams.user || (isLocal ? 'dev-agent' : remoteAddr);
+
+            // Handle token counting locally to save DeepSeek rate limits
+            if (cleanPath.endsWith('/count_tokens')) {
+                const text = normalizeMessageContent(bodyParams.messages || bodyParams.prompt || '');
+                const tokens = estimateTokens(text);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ input_tokens: tokens, output_tokens: 0 }));
+                return;
+            }
+
+            // Extract session ID from headers OR metadata.user_id ("user_..._session_<uuid>")
+            let metaSessionId = null;
+            if (bodyParams.metadata && typeof bodyParams.metadata.user_id === 'string') {
+                const m = bodyParams.metadata.user_id.match(/_session_([a-zA-Z0-9_-]+)/);
+                metaSessionId = m ? m[1] : bodyParams.metadata.user_id;
+            }
+            const requestedSession = req.headers['x-claude-code-session-id'] || req.headers['x-agent-session'] || metaSessionId || bodyParams.session || bodyParams.user || (isLocal ? 'dev-agent' : remoteAddr);
             const agentId = String(requestedSession);
             const account = getAccountForAgent(agentId);
             const accountId = account ? account.id : 'no-account';
-            
+
+            // Fast-path 1-token connectivity ping (messages: [{ role: 'user', content: '.' }], max_tokens: 1)
+            if (bodyParams.max_tokens === 1 && Array.isArray(bodyParams.messages) && bodyParams.messages.length === 1 && String(bodyParams.messages[0].content || '').trim() === '.') {
+                const pingModel = String(bodyParams.model || 'claude-haiku-5-5');
+                const pingResp = buildTextResponse('.', '.', pingModel, '');
+                if (bodyParams.stream === true && apiMode === 'anthropic') {
+                    sendAnthropicStream(res, pingResp);
+                } else {
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify(apiMode === 'anthropic' ? toAnthropicResponse(pingResp) : pingResp));
+                }
+                return;
+            }
+
             writeLog(accountId, agentId, 'INCOMING-REQUEST', {
                 path: cleanPath,
                 headers: req.headers,
@@ -1259,20 +1881,19 @@ const server = http.createServer(async (req, res) => {
             const messages = params.messages || [];
             const tools = params.tools || [];
             const stream = params.stream === true;
-            const agentTag = `[${agentId}]`;
+            const agentTag = `[${agentId.substring(0, 12)}]`;
 
             // --- Rate Limiting Check ---
             const rl = checkRateLimit(agentId);
             if (rl.limited) {
                 const waitSec = Math.ceil(rl.waitMs / 1000);
-                console.log(`${agentTag} ⏳ Rate limit reached (3 req/min). Waiting ${waitSec}s...`);
+                console.log(`${agentTag} ⏳ Rate limit reached (${RATE_LIMIT_COUNT} req/min). Waiting ${waitSec}s...`);
                 await new Promise(r => setTimeout(r, rl.waitMs));
-                // Re-log the current request after waiting so it counts for the next window
-                checkRateLimit(agentId); 
+                checkRateLimit(agentId);
             }
             // ---------------------------
             
-            let requestedModel = String(params.model || 'deepseek-chat').toLowerCase();
+            let requestedModel = String(params.model || 'deepseek-flash').toLowerCase();
             
             writeLog(accountId, agentId, 'MODEL-INFO', { 
                 requested_model: requestedModel,
@@ -1281,26 +1902,25 @@ const server = http.createServer(async (req, res) => {
             });
 
             if (!isKnownModel(requestedModel)) {
-                const fallback = 'deepseek-chat';
+                const fallback = 'deepseek-flash';
                 console.log(`[DS-API] ${agentTag} 🔀 Model Mapping: "${requestedModel}" -> "${fallback}" (Unknown model)`);
                 writeLog(accountId, agentId, 'MODEL-MAPPING', { from: requestedModel, to: fallback, reason: 'unknown' });
                 requestedModel = fallback;
             } else if (!isSupportedModel(requestedModel)) {
-                const fallback = 'deepseek-chat';
+                const fallback = 'deepseek-flash';
                 const cfg = resolveModelConfig(requestedModel);
                 console.log(`[DS-API] ${agentTag} ⚠️ Model "${requestedModel}" is unsupported (${cfg.unavailable_reason || 'disabled'}). Mapping to "${fallback}"`);
                 writeLog(accountId, agentId, 'MODEL-MAPPING', { from: requestedModel, to: fallback, reason: 'unsupported', detail: cfg.unavailable_reason });
                 requestedModel = fallback;
             }
             const { prompt, systemPrompt } = formatMessages(messages, tools);
-
-            const session = await ensureAgentSession(agentId, account);
+            const localSession = getOrCreateAgentSession(agentId);
 
             // Build history prefix if starting fresh
             let historyPrefix = '';
-            if (session.messageCount === 0 && session.history.length > 0) {
+            if (localSession.messageCount === 0 && localSession.history.length > 0) {
                 historyPrefix = '[Previous conversation]\n';
-                for (const exchange of session.history) {
+                for (const exchange of localSession.history) {
                     historyPrefix += `User: ${exchange.user}\nAssistant: ${exchange.assistant}\n\n`;
                 }
                 historyPrefix += '[Continue from here]\n\n';
@@ -1310,6 +1930,362 @@ const server = http.createServer(async (req, res) => {
                 ? `${systemPrompt}\n\n${historyPrefix}${prompt}`
                 : `${historyPrefix}${prompt}`;
 
+            // --- Provider Routing ---
+            if (accountPool.size === 0) loadAccountPool();
+            const activeProvider = (process.env.ACTIVE_PROVIDER || settings.primary_provider || (accountPool.size > 0 ? 'deepseek' : 'gemini')).toLowerCase();
+            const isExplicitGemini = requestedModel.toLowerCase().includes('gemini');
+            const isExplicitDeepSeek = requestedModel.toLowerCase().includes('deepseek');
+
+            let isGeminiRequested = false;
+            if (isExplicitGemini) {
+                isGeminiRequested = true;
+            } else if (isExplicitDeepSeek) {
+                isGeminiRequested = false;
+            } else if (activeProvider === 'deepseek') {
+                isGeminiRequested = false;
+            } else if (activeProvider === 'gemini') {
+                isGeminiRequested = true;
+            } else {
+                isGeminiRequested = accountPool.size === 0 && geminiClient.isReady();
+            }
+
+            if (isGeminiRequested && geminiClient.isReady()) {
+                // Fast-path Claude Desktop & Claude Code session title generators so they don't hit Gemini or pollute sessions
+                if (
+                    fullPrompt.includes('You are naming a coding session') ||
+                    fullPrompt.includes('Return JSON with a single "title" field') ||
+                    fullPrompt.includes('You write short session titles') ||
+                    fullPrompt.includes('coming up with a succinct title for a coding session')
+                ) {
+                    const descMatch = fullPrompt.match(/<description>([\s\S]*?)<\/description>/i);
+                    const rawDesc = descMatch ? descMatch[1].trim().replace(/\s+/g, ' ').slice(0, 40) : 'Сессия Gemini';
+                    const titlePayload = fullPrompt.includes('<title>')
+                        ? `<title>${rawDesc || 'Сессия Gemini'}</title>`
+                        : JSON.stringify({ title: rawDesc || 'Gemini Coding Session' });
+                    const titleResp = buildTextResponse(titlePayload, fullPrompt, requestedModel, '');
+                    if (stream && apiMode === 'anthropic') sendAnthropicStream(res, titleResp);
+                    else { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(apiMode === 'anthropic' ? toAnthropicResponse(titleResp) : titleResp)); }
+                    return;
+                }
+                if (fullPrompt.includes('[SUGGESTION MODE:') || fullPrompt.includes('Suggest what the user might naturally type next')) {
+                    const emptyResp = buildTextResponse('', fullPrompt, requestedModel, '');
+                    if (stream && apiMode === 'anthropic') sendAnthropicStream(res, emptyResp);
+                    else { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(apiMode === 'anthropic' ? toAnthropicResponse(emptyResp) : emptyResp)); }
+                    return;
+                }
+                if (fullPrompt.includes('The user stepped away and is coming back. Recap in under 40 words')) {
+                    const recapResp = buildTextResponse('Сессия Google Gemini активна и привязана к текущему диалогу.', fullPrompt, requestedModel, '');
+                    if (stream && apiMode === 'anthropic') sendAnthropicStream(res, recapResp);
+                    else { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(apiMode === 'anthropic' ? toAnthropicResponse(recapResp) : recapResp)); }
+                    return;
+                }
+
+                // If the previous turn auto-triggered SendUserFile to display a generated HTML/code file in Claude Desktop,
+                // immediately return the cached explanation + code response on the tool_result turn without calling Gemini twice!
+                const lastIncomingMsg = messages.length > 0 ? messages[messages.length - 1] : null;
+                if (localSession.pendingPostFileText && lastIncomingMsg && lastIncomingMsg.role === 'tool') {
+                    const cachedText = localSession.pendingPostFileText;
+                    const cachedReasoning = localSession.pendingPostFileReasoning || '';
+                    localSession.pendingPostFileText = null;
+                    localSession.pendingPostFileReasoning = null;
+                    const cachedResp = buildTextResponse(cachedText, fullPrompt, requestedModel, cachedReasoning);
+                    if (stream) {
+                        if (apiMode === 'anthropic') sendAnthropicStream(res, cachedResp);
+                        else if (apiMode === 'responses') sendResponsesStream(res, cachedResp);
+                        else sendOpenAIStream(res, cachedResp);
+                    } else {
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify(apiMode === 'anthropic' ? toAnthropicResponse(cachedResp) : (apiMode === 'responses' ? toResponsesResponse(cachedResp) : cachedResp)));
+                    }
+                    console.log('[API] ' + agentTag + ' ✅ Delivered cached post-file text (' + cachedText.length + ' chars) after SendUserFile');
+                    return;
+                }
+
+                const {
+                    fullPrompt: geminiPrompt,
+                    plainPrompt: geminiPlainPrompt,
+                    deltaPrompt: geminiDeltaPrompt,
+                    images: geminiImages,
+                    deltaImages: geminiDeltaImages,
+                    detectedCwd,
+                    fingerprint,
+                    lastUserText
+                } = formatMessagesForGemini(messages, tools);
+
+                // Resolve effective Gemini model:
+                // 1) Per-session lock via `/gemini model <argon|pro|flash|lite>`
+                // 2) If user changed the dropdown model in Claude Desktop during the session, update and honor the dropdown
+                // 3) Launcher / settings forced model (`process.env.GEMINI_FORCE_MODEL` or `settings.gemini?.force_model`)
+                // 4) Requested model from client (`params.model`)
+                if (localSession.lastClientModel && localSession.lastClientModel !== requestedModel) {
+                    // User actively switched the model selector in Claude Desktop / CLI!
+                    console.log(`[API] ${agentTag} 🔀 Client switched model selector: ${localSession.lastClientModel} -> ${requestedModel}`);
+                    if (localSession.forcedModelSource === 'launcher') {
+                        localSession.forcedGeminiModel = null;
+                        localSession.forcedModelSource = null;
+                    }
+                }
+                localSession.lastClientModel = requestedModel;
+
+                const envForceModel = process.env.GEMINI_FORCE_MODEL || settings.gemini?.force_model || null;
+                if (!localSession.forcedGeminiModel && envForceModel && !localSession.forcedModelCleared) {
+                    localSession.forcedGeminiModel = envForceModel;
+                    localSession.forcedModelSource = 'launcher';
+                }
+
+                let effectiveGeminiModel = localSession.forcedGeminiModel || requestedModel;
+                let activeModelSpec = geminiClient.resolveModelSpec(effectiveGeminiModel);
+
+                // Interactive /gemini session & model control command right inside the chat
+                const geminiCmdMatch = String(lastUserText || '').trim().match(/^\/(?:gemini|сессия)(?:\s+(.+))?$/i);
+                if (geminiCmdMatch) {
+                    const arg = (geminiCmdMatch[1] || 'status').trim();
+                    let cmdReply = '';
+                    const modelSubMatch = arg.match(/^(?:model|модель)(?:\s+(.+))?$/i);
+
+                    if (modelSubMatch) {
+                        const targetArg = (modelSubMatch[1] || '').trim().toLowerCase();
+                        if (!targetArg || targetArg === 'status') {
+                            cmdReply = [
+                                '🎯 **Текущая модель Google Gemini:**',
+                                '- **Активная модель:** `' + activeModelSpec.canonicalId + '` (' + activeModelSpec.displayName + ')',
+                                '- **Режим выбора:** ' + (localSession.forcedGeminiModel ? ('Закреплена (`' + localSession.forcedGeminiModel + '`, источник: ' + (localSession.forcedModelSource || 'chat') + ')') : 'Авто (по выбору в Claude Desktop / CLI)'),
+                                '- **Параметры протокола:** `modeCategory=' + activeModelSpec.modeCategory + '`, `expandedThinking=' + activeModelSpec.expandedThinking + '`, `tier=' + activeModelSpec.tierNum + '`, `modeId=' + activeModelSpec.modeId + '`',
+                                '',
+                                '**Доступные команды выбора модели:**',
+                                '- `/gemini model argon` — закрепить **4 Argon** (Сложные задачи / Новинка)',
+                                '- `/gemini model pro` — закрепить **3.1 Pro** (Расширенные рассуждения)',
+                                '- `/gemini model flash` — закрепить **3.8 Flash** (Универсальная быстрая)',
+                                '- `/gemini model lite` — закрепить **3.5 Flash-Lite** (Самые быстрые ответы)',
+                                '- `/gemini model auto` — выбирать модель через выпадающий список Claude Desktop (`Fable/Opus` = 4 Argon, `Sonnet` = 3.1 Pro, `Haiku` = 3.8 Flash)'
+                            ].join('\n');
+                        } else if (['auto', 'авто', 'reset', 'default'].includes(targetArg)) {
+                            localSession.forcedGeminiModel = null;
+                            localSession.forcedModelSource = null;
+                            localSession.forcedModelCleared = true;
+                            const newSpec = geminiClient.resolveModelSpec(requestedModel);
+                            cmdReply = '✅ **Включён автоматический выбор модели из интерфейса клиента.**\nСейчас выбрана: `' + newSpec.canonicalId + '` (' + newSpec.displayName + ').';
+                        } else {
+                            const pickedSpec = geminiClient.resolveModelSpec(targetArg);
+                            localSession.forcedGeminiModel = pickedSpec.canonicalId;
+                            localSession.forcedModelSource = 'chat_command';
+                            localSession.forcedModelCleared = false;
+                            effectiveGeminiModel = pickedSpec.canonicalId;
+                            activeModelSpec = pickedSpec;
+                            cmdReply = [
+                                '✅ **Модель успешно переключена и закреплена:**',
+                                '- **Модель:** `' + pickedSpec.canonicalId + '` — **' + pickedSpec.displayName + '**',
+                                '- **Параметры Gemini Web:** `mode=' + pickedSpec.modeCategory + '`, `expandedThinking=' + pickedSpec.expandedThinking + '`, `tier=' + pickedSpec.tierNum + '`, `modeId=' + pickedSpec.modeId + '`',
+                                '',
+                                '*(Чтобы вернуть управление выпадающему списку Claude Desktop, отправьте `/gemini model auto`)*'
+                            ].join('\n');
+                        }
+                    } else if (/^(?:models|модели)$/i.test(arg)) {
+                        const disc = await geminiClient.fetchAccountModelsOnce();
+                        cmdReply = [
+                            '📋 **Модели Google Gemini и их параметры в вашем аккаунте:**',
+                            '- **4 Argon** (`gemini-4-argon` / `Fable 5.1` / `Opus 5.5`): `mode=3, thinking=2, tier=3, id=' + geminiClient.resolveModelSpec('gemini-4-argon').modeId + '`',
+                            '- **3.1 Pro** (`gemini-3.1-pro` / `Sonnet 5.5`): `mode=3, thinking=2, tier=3, id=' + geminiClient.resolveModelSpec('gemini-3.1-pro').modeId + '`',
+                            '- **3.8 Flash** (`gemini-3.8-flash` / `Haiku 5.5`): `mode=1, thinking=1, tier=1, id=' + geminiClient.resolveModelSpec('gemini-3.8-flash').modeId + '`',
+                            '- **3.5 Flash-Lite** (`gemini-3.5-flash-lite`): `mode=6, thinking=1, tier=6, id=' + geminiClient.resolveModelSpec('gemini-3.5-flash-lite').modeId + '`',
+                            disc && Object.keys(disc).length > 0
+                                ? ('\n🔍 **Авто-обнаруженные ID аккаунта (otAQ7b):** `' + JSON.stringify(disc) + '`')
+                                : ''
+                        ].filter(Boolean).join('\n');
+                    } else if (/^(?:new|reset|сброс|новая)$/i.test(arg)) {
+                        geminiClient.clearSessionBinding(agentId, fingerprint);
+                        localSession.id = null;
+                        localSession.parentMessageId = null;
+                        localSession.messageCount = 0;
+                        cmdReply = '🔄 **Привязка сессии Gemini сброшена.** Следующее сообщение автоматически создаст новый чат в Google Gemini с моделью `' + activeModelSpec.canonicalId + '` (' + activeModelSpec.displayName + ').';
+                    } else if (/^(?:status|статус)$/i.test(arg)) {
+                        const cur = geminiClient.getSessionBinding(agentId, fingerprint, settings.gemini?.preferred_chat_id || null);
+                        cmdReply = [
+                            '🎯 **Активная модель:** `' + activeModelSpec.canonicalId + '` — **' + activeModelSpec.displayName + '**',
+                            '- **Источник выбора:** ' + (localSession.forcedGeminiModel ? ('Закреплена (`' + localSession.forcedGeminiModel + '`)') : ('Выбрана в клиенте (`' + requestedModel + '` -> `' + activeModelSpec.canonicalId + '`)')),
+                            '- **Протокол Gemini Web:** `modeCategory=' + activeModelSpec.modeCategory + '`, `expandedThinking=' + activeModelSpec.expandedThinking + '`, `tier=' + activeModelSpec.tierNum + '`, `modeId=' + activeModelSpec.modeId + '`',
+                            '',
+                            cur && cur.convId
+                                ? [
+                                    '🔗 **Привязанный чат Google Gemini:**',
+                                    '- **ID чата:** `' + cur.convId + '`',
+                                    '- **Ссылка в браузере:** ' + GeminiClient.formatConvUrl(cur.convId),
+                                    '- **Последний ответ (respId):** `' + (cur.respId || 'нет') + '`',
+                                    '- **Сообщений в ветке:** ' + (cur.turnCount || 1)
+                                ].join('\n')
+                                : 'ℹ️ Чат в Gemini создастся автоматически при следующем сообщении.',
+                            '',
+                            '**Команды управления:**',
+                            '- `/gemini model argon | pro | flash | lite | auto` — переключить модель',
+                            '- `/gemini models` — проверить ID моделей аккаунта',
+                            '- `/gemini <ссылка или ID чата>` — привязать существующий чат из браузера',
+                            '- `/gemini new` — начать новый чат Gemini'
+                        ].join('\n');
+                    } else {
+                        const bound = geminiClient.bindSessionToConv(agentId, fingerprint, arg);
+                        if (bound) {
+                            localSession.id = bound.convId;
+                            localSession.parentMessageId = bound.respId;
+                            cmdReply = '✅ **Диалог успешно привязан к чату Google Gemini:**\n- **ID:** `' + bound.convId + '`\n- **Ссылка:** ' + bound.url + '\n- **Активная модель:** `' + activeModelSpec.canonicalId + '`';
+                        } else {
+                            cmdReply = '⚠️ Неизвестная команда. Используйте `/gemini status`, `/gemini model argon|pro|flash|lite|auto`, `/gemini new` или `/gemini https://gemini.google.com/app/<ID>`.';
+                        }
+                    }
+                    const cmdResp = buildTextResponse(cmdReply, fullPrompt, requestedModel, '');
+                    if (stream && apiMode === 'anthropic') sendAnthropicStream(res, cmdResp);
+                    else { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(apiMode === 'anthropic' ? toAnthropicResponse(cmdResp) : cmdResp)); }
+                    return;
+                }
+
+                // Resolve persistent Gemini session binding for this Claude session / conversation fingerprint
+                const existingBinding = geminiClient.getSessionBinding(agentId, fingerprint, settings.gemini?.preferred_chat_id || null);
+                const hasBoundTurn = Boolean(existingBinding && existingBinding.convId && existingBinding.respId);
+
+                // When continuing a bound Gemini chat (hasBoundTurn), send only the new turn (deltaPrompt) and new images (deltaImages)
+                // so Gemini continues natively inside the exact same chat thread without duplicating history or re-uploading old images!
+                const activePrompt = hasBoundTurn ? geminiDeltaPrompt : geminiPrompt;
+                const activeImages = hasBoundTurn ? geminiDeltaImages : geminiImages;
+
+                const targetGemini = geminiClient.resolveTargetGeminiName(effectiveGeminiModel);
+                if (existingBinding && existingBinding.convId) {
+                    console.log('[API] ' + agentTag + ' 🔗 Bound Gemini Chat: ' + GeminiClient.formatConvUrl(existingBinding.convId) + ' (turn #' + ((existingBinding.turnCount || 0) + 1) + ', delta=' + activePrompt.length + ' chars, new_images=' + (activeImages ? activeImages.length : 0) + ')');
+                } else {
+                    console.log('[API] ' + agentTag + ' 🚀 Routing NEW Gemini Chat: ' + requestedModel + ' -> Google Gemini [' + targetGemini + '] (prompt=' + activePrompt.length + ' chars, images=' + (activeImages ? activeImages.length : 0) + ')');
+                }
+                const startTime = Date.now();
+                
+                try {
+                    const targetChatId = existingBinding?.convId || settings.gemini?.preferred_chat_id || null;
+                    const result = await geminiClient.sendPrompt(
+                        activePrompt,
+                        null,
+                        targetChatId,
+                        effectiveGeminiModel,
+                        0,
+                        geminiPlainPrompt,
+                        activeImages,
+                        null,
+                        hasBoundTurn ? existingBinding : null,
+                        geminiPrompt,
+                        geminiImages
+                    );
+                    let replyText = sanitizeContent(result.text || '');
+                    const replyReasoning = sanitizeContent(result.reasoning || '');
+                    let toolCall = parseToolCall(replyText);
+
+                    // Save updated Gemini conversation binding (convId, respId, choiceId) persistently to .gemini/gemini-sessions.json
+                    if (result.conversationId) {
+                        const savedBind = geminiClient.saveSessionBinding(agentId, fingerprint, {
+                            convId: result.conversationId,
+                            respId: result.responseId,
+                            choiceId: result.choiceId,
+                            model: activeModelSpec.canonicalId
+                        });
+                        localSession.id = result.conversationId;
+                        localSession.parentMessageId = result.responseId || null;
+                        localSession.createdAt = localSession.createdAt || Date.now();
+                        localSession.messageCount = savedBind ? savedBind.turnCount : (localSession.messageCount + 1);
+                        console.log('[API] ' + agentTag + ' 💾 Saved Gemini session link: ' + GeminiClient.formatConvUrl(result.conversationId) + ' (respId=' + (result.responseId || 'none') + ')');
+                    }
+
+                    // Collect any generated files from result.files or from large fenced html/jsx blocks in replyText
+                    const candidateFiles = Array.isArray(result.files) ? [...result.files] : [];
+                    if (!toolCall && candidateFiles.length === 0) {
+                        const codeBlockMatch = replyText.match(/```(html|htm|jsx|tsx|react)\s*\n([\s\S]{160,}?)```/i);
+                        if (codeBlockMatch) {
+                            const lang = codeBlockMatch[1].toLowerCase();
+                            const codeBody = codeBlockMatch[2].trim();
+                            const nameMatch = replyText.match(/`([a-zA-Z0-9_.-]+\.(?:html|htm|jsx|tsx))`/)
+                                || replyText.match(/\b([a-zA-Z0-9_-]+\.(?:html|htm|jsx|tsx))\b/);
+                            const defaultExt = (lang === 'jsx' || lang === 'tsx' || lang === 'react') ? '.jsx' : '.html';
+                            const fileName = nameMatch ? nameMatch[1] : ('app_' + Date.now() + defaultExt);
+                            candidateFiles.push({ name: fileName, content: codeBody, source: 'markdown_code_block' });
+                        }
+                    }
+
+                    // If files were generated (from Canvas, python?code_reference, <file_write>, or markdown block) and no toolCall was emitted:
+                    // Save them directly to the user's working directory AND auto-trigger SendUserFile so Claude Desktop previews & attaches the file!
+                    if (!toolCall && candidateFiles.length > 0) {
+                        const targetDir = (detectedCwd && fs.existsSync(detectedCwd))
+                            ? detectedCwd
+                            : __dirname;
+                        const savedHtmlPaths = [];
+
+                        for (const cf of candidateFiles) {
+                            try {
+                                const safeBaseName = path.basename(cf.name || 'app.html').replace(/[^a-zA-Z0-9_.-]/g, '_');
+                                const rawPath = path.join(targetDir, safeBaseName);
+                                fs.writeFileSync(rawPath, cf.content, 'utf8');
+
+                                const { htmlName, htmlContent } = ensureStandaloneHtml(cf.content, safeBaseName);
+                                const htmlPath = path.join(targetDir, path.basename(htmlName));
+                                if (htmlPath !== rawPath || htmlContent !== cf.content) {
+                                    fs.writeFileSync(htmlPath, htmlContent, 'utf8');
+                                }
+                                savedHtmlPaths.push(htmlPath);
+                                console.log('[API] ' + agentTag + ' 💾 Saved generated file to disk: ' + htmlPath + ' (' + Math.round(htmlContent.length / 1024) + ' KB)');
+                            } catch (saveErr) {
+                                console.warn('[API] ' + agentTag + ' ⚠️ Could not save generated file:', saveErr.message);
+                            }
+                        }
+
+                        if (savedHtmlPaths.length > 0) {
+                            const fileListNote = savedHtmlPaths.map(p => '`' + p + '`').join(', ');
+                            replyText += '\n\n✅ **Файл сохранён на компьютер:** ' + fileListNote;
+
+                            const hasSendUserFileTool = Array.isArray(tools) && tools.some(t => (t.function?.name || t.name) === 'SendUserFile');
+                            if (hasSendUserFileTool) {
+                                localSession.pendingPostFileText = replyText;
+                                localSession.pendingPostFileReasoning = replyReasoning;
+                                toolCall = {
+                                    name: 'SendUserFile',
+                                    arguments: JSON.stringify({
+                                        files: [savedHtmlPaths[0]],
+                                        status: 'normal',
+                                        display: 'render',
+                                        caption: 'Готовое приложение: ' + path.basename(savedHtmlPaths[0])
+                                    })
+                                };
+                                console.log('[API] ' + agentTag + ' 📤 Auto-invoking SendUserFile for ' + savedHtmlPaths[0]);
+                            }
+                        }
+                    }
+
+                    const openaiResp = toolCall 
+                        ? buildToolCallResponse(toolCall, requestedModel, geminiPrompt, '') 
+                        : buildTextResponse(replyText, geminiPrompt, requestedModel, replyReasoning);
+
+                    if (stream) {
+                        if (apiMode === 'anthropic') {
+                            sendAnthropicStream(res, openaiResp);
+                        } else if (apiMode === 'responses') {
+                            sendResponsesStream(res, openaiResp);
+                        } else {
+                            sendOpenAIStream(res, openaiResp);
+                        }
+                        console.log('[API] ' + agentTag + ' Streamed Gemini [' + targetGemini + '] in ' + (Date.now() - startTime) + 'ms (' + replyText.length + ' chars, tool=' + (!!toolCall) + ')');
+                    } else {
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        if (apiMode === 'anthropic') {
+                            res.end(JSON.stringify(toAnthropicResponse(openaiResp)));
+                        } else if (apiMode === 'responses') {
+                            res.end(JSON.stringify(toResponsesResponse(openaiResp)));
+                        } else {
+                            res.end(JSON.stringify(openaiResp));
+                        }
+                        console.log('[API] ' + agentTag + ' Completed Gemini [' + targetGemini + '] in ' + (Date.now() - startTime) + 'ms (' + replyText.length + ' chars, tool=' + (!!toolCall) + ')');
+                    }
+                    storeHistory(agentId, prompt, fullPrompt, toolCall);
+                    return;
+                } catch (geminiErr) {
+                    console.error('[API] ' + agentTag + ' Gemini request failed:', geminiErr.message);
+                    res.writeHead(502, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: { message: 'Gemini Web Error: ' + geminiErr.message, type: 'gemini_error' } }));
+                    return;
+                }
+            }
+
+            const session = await ensureAgentSession(agentId, account);
             const startTime = Date.now();
             const { resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
 
@@ -1578,40 +2554,42 @@ async function runAuthScript(suffix = '') {
 
 function printStatus() {
     console.log(`\n${formatWatermark()}`);
-    console.log(`Аккаунтов загружено: ${accountPool.size}`);
+    console.log(`DeepSeek аккаунтов: ${accountPool.size}`);
     if (accountPool.size > 0) {
-        console.log(`Список: ${Array.from(accountPool.keys()).join(', ')}`);
-    } else {
-        console.log(`❌ Аккаунты не найдены в ${DEEPSEEK_DIR}`);
+        console.log(`  Список: ${Array.from(accountPool.keys()).join(', ')}`);
     }
+    const geminiReady = (typeof geminiClient !== 'undefined' && geminiClient.isReady());
+    console.log(`Gemini Pro аккаунтов: ${geminiReady ? '✅ 1 (активен)' : '⚠️ Не настроен (.gemini)'}`);
     console.log(`Рабочие модели: ${SUPPORTED_MODEL_IDS.length}`);
 }
 
 async function showStartupMenu() {
     if (isTruthy(process.env.SKIP_ACCOUNT_MENU) || isTruthy(process.env.NON_INTERACTIVE)) {
         loadDeepSeekConfig();
-        return hasAuthConfig();
+        return true;
     }
     while (true) {
         printStatus();
-        console.log('1 - Добавить/обновить основной аккаунт (default)');
-        console.log('2 - Добавить дополнительный аккаунт (с ID)');
+        console.log('1 - Меню авторизации аккаунтов (Gemini / DeepSeek)');
+        console.log('2 - Добавить дополнительный аккаунт DeepSeek (с ID)');
         console.log('3 - Показать модели и статусы');
         console.log('4 - Запустить сервер (по умолчанию)');
         console.log('5 - Выход');
         let choice = await prompt('Ваш выбор (Enter = 4): ');
         if (!choice) choice = '4';
         if (choice === '1') {
-            await runAuthScript();
+            const script = path.join(__dirname, 'scripts', 'auth.js');
+            spawnSync(process.execPath, [script], { stdio: 'inherit' });
+            loadDeepSeekConfig();
         } else if (choice === '2') {
-            const id = await prompt('Введите ID для аккаунта (например, acc2): ');
+            const id = await prompt('Введите ID для аккаунта DeepSeek (например, acc2): ');
             if (id) await runAuthScript(id);
         } else if (choice === '3') {
             console.log(JSON.stringify(ALL_MODEL_CAPABILITIES, null, 2));
             await prompt('\nНажмите Enter, чтобы вернуться в меню...');
         } else if (choice === '4') {
             if (!hasAuthConfig()) {
-                console.log('Нужен хотя бы один аккаунт. Запустите пункт 1.');
+                console.log('Нужен хотя бы один аккаунт (Gemini или DeepSeek). Нажмите 1 для входа.');
                 continue;
             }
             return true;
@@ -1626,7 +2604,8 @@ async function main() {
     const shouldStart = await showStartupMenu();
     if (!shouldStart) process.exit(0);
     server.listen(PORT, HOST, () => {
-        console.log(`[DS-API] Server on http://${HOST}:${PORT} (multi-agent sessions enabled)`);
+        console.log(`[Gateway] ✅ Server listening on http://${HOST}:${PORT}`);
+        console.log(`[Gateway] Active Provider: ${process.env.ACTIVE_PROVIDER || settings.primary_provider || 'auto'} | Gemini Ready: ${geminiClient.isReady() ? 'YES' : 'NO'} | DeepSeek Accounts: ${accountPool.size}`);
         console.log(`[DS-API] ${formatWatermark()}`);
         console.log('[DS-API] POST /v1/chat/completions (OpenAI Chat Completions, stream=true|false)');
         console.log('[DS-API] POST /v1/messages — Anthropic Messages shim for Claude Code');
